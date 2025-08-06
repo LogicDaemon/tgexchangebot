@@ -22,6 +22,25 @@ type TableSchema struct {
 	Columns []TableColumn
 }
 
+func getLastUpdateId(db *sql.DB) int {
+	var lastUpdateID int
+	err := db.QueryRow("SELECT last_update_id FROM bot_settings WHERE id = 1").Scan(&lastUpdateID)
+	if err != nil {
+		log.Printf("Error getting last update ID: %v", err)
+		return 0 // Default to 0 if not found
+	}
+	return lastUpdateID
+}
+
+// saveLastUpdateID saves the last processed update ID to the database
+func saveLastUpdateID(db *sql.DB, updateID int) {
+	log.Printf("Saving last update ID: %d", updateID)
+	_, err := db.Exec("UPDATE bot_settings SET last_update_id = ? WHERE id = 1", updateID)
+	if err != nil {
+		log.Printf("Error saving last update ID: %v", err)
+	}
+}
+
 // getUserReputation gets user reputation from database
 func getUserReputation(db *sql.DB, userID int) (int, error) {
 	var reputation int
@@ -125,6 +144,13 @@ func findMatchingOffers(db *sql.DB, offer *ParsedOffer) ([]map[string]interface{
 // getExpectedSchemas returns the expected database schemas
 func getExpectedSchemas() []TableSchema {
 	return []TableSchema{
+		{
+			Name: "bot_settings",
+			Columns: []TableColumn{
+				{Name: "id", Type: "INTEGER", PrimaryKey: true},
+				{Name: "last_update_id", Type: "INTEGER", NotNull: true, DefaultValue: "0"},
+			},
+		},
 		{
 			Name: "exchangers",
 			Columns: []TableColumn{

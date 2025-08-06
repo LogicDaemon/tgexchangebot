@@ -175,7 +175,7 @@ func printInstructions() {
 	fmt.Println("   Use the 'Id' number from the 'Forwarded from chat' value (including the negative sign)")
 }
 
-func Init() (*Secrets, *Settings) {
+func getConfig() (*Secrets, *Settings) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Initialization failed: %v", r)

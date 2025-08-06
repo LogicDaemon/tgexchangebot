@@ -310,9 +310,72 @@ func (ctx BotContext) logToTelegramAndConsole(message string) {
 	}
 }
 
-// setupMessageHandler sets up the message handling loop
-func (ctx *BotContext) setupMessageHandler(settings *Settings) {
-	u := tgbotapi.NewUpdate(0)
+// handleUpdate processes incoming updates from Telegram
+func (ctx *BotContext) handleUpdate(update tgbotapi.Update) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicMsg := fmt.Errorf("recovered from panic: %v", r)
+			if err == nil {
+				err = panicMsg
+			} else {
+				err = fmt.Errorf("%w; %v", err, panicMsg)
+			}
+		}
+	}()
+	if update.Message == nil {
+		return nil
+	}
+
+	message := update.Message
+
+	// Handle commands
+	if command := message.Command(); command != "" {
+		ctx.logToTelegramAndConsole(fmt.Sprintf(`Received command "%s" from user "%s"`, command, message.From.UserName))
+
+		var err error
+		switch command {
+		case "buy":
+			err = ctx.handleBuyCommand(message)
+		case "sell":
+			err = ctx.handleSellCommand(message)
+		case "stats":
+			err = ctx.handleStatsCommand(message)
+		case "list":
+			err = ctx.handleListCommand(message)
+		default:
+			reply := tgbotapi.NewMessage(message.Chat.ID, "Unknown command. Available commands: /buy, /sell, /stats, /list")
+			_, err = ctx.bot.Send(reply)
+			if err != nil {
+				log.Printf("Error sending reply: %v", err)
+			}
+			return err
+		}
+		if err != nil {
+			log.Printf("Error handling %s command: %v", command, err)
+		}
+	}
+
+	// Handle callback queries (for feedback buttons)
+	if update.CallbackQuery != nil {
+		callback := update.CallbackQuery
+		if strings.HasPrefix(callback.Data, "feedback_") {
+			// Handle feedback button press
+			response := tgbotapi.CallbackConfig{
+				CallbackQueryID: callback.ID,
+				Text:            "Feedback feature coming soon!",
+			}
+			_, err := ctx.bot.AnswerCallbackQuery(response)
+			if err != nil {
+				log.Printf("Error answering callback: %v", err)
+			}
+		}
+	}
+	return nil
+}
+
+// handleUpdates sets up the message handling loop
+func (ctx *BotContext) handleUpdates() {
+	u := tgbotapi.NewUpdate(getLastUpdateId(ctx.db))
 	u.Timeout = 60
 
 	updates, err := ctx.bot.GetUpdatesChan(u)
@@ -321,60 +384,17 @@ func (ctx *BotContext) setupMessageHandler(settings *Settings) {
 	}
 
 	for update := range updates {
-		if update.Message == nil {
-			continue
-		}
-
-		message := update.Message
-
-		// Handle commands
-		if command := message.Command(); command != "" {
-			ctx.logToTelegramAndConsole(fmt.Sprintf(`Received command "%s" from user "%s"`, command, message.From.UserName))
-
-			var err error
-			switch command {
-			case "buy":
-				err = ctx.handleBuyCommand(message)
-			case "sell":
-				err = ctx.handleSellCommand(message)
-			case "stats":
-				err = ctx.handleStatsCommand(message)
-			case "list":
-				err = ctx.handleListCommand(message)
-			default:
-				reply := tgbotapi.NewMessage(message.Chat.ID, "Unknown command. Available commands: /buy, /sell, /stats, /list")
-				_, err = ctx.bot.Send(reply)
-				if err != nil {
-					log.Printf("Error sending reply: %v", err)
-				}
-				continue
-			}
-			if err != nil {
-				log.Printf("Error handling %s command: %v", command, err)
-			}
-		}
-
-		// Handle callback queries (for feedback buttons)
-		if update.CallbackQuery != nil {
-			callback := update.CallbackQuery
-			if strings.HasPrefix(callback.Data, "feedback_") {
-				// Handle feedback button press
-				response := tgbotapi.CallbackConfig{
-					CallbackQueryID: callback.ID,
-					Text:            "Feedback feature coming soon!",
-				}
-				_, err := ctx.bot.AnswerCallbackQuery(response)
-				if err != nil {
-					log.Printf("Error answering callback: %v", err)
-				}
-			}
+		if err := ctx.handleUpdate(update); err != nil {
+			ctx.logToTelegramAndConsole(fmt.Sprintf("Error handling update: %v", err))
+		} else {
+			saveLastUpdateID(ctx.db, update.UpdateID)
 		}
 	}
 }
 
 // Run executes the service
-func Run() {
-	secrets, settings := Init()
+func main() {
+	secrets, settings := getConfig()
 	db := initDB(getDBPath())
 	defer db.Close()
 
@@ -399,9 +419,5 @@ func Run() {
 	}
 
 	// Start message handler
-	ctx.setupMessageHandler(settings)
-}
-
-func main() {
-	Run()
+	ctx.handleUpdates()
 }
