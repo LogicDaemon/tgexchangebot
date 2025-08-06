@@ -19,7 +19,7 @@ type Secrets struct {
 
 // Settings holds the configuration settings for the bot
 type Settings struct {
-	TelegramChannelID int64 `json:"telegram_channel_id"`
+	TelegramServiceChannelID int64 `json:"telegram_service_channel_id"`
 }
 
 const (
@@ -120,7 +120,7 @@ func loadSettings() *Settings {
 		panic(fmt.Errorf("error parsing settings file: %v", err))
 	}
 
-	if settings.TelegramChannelID == 0 {
+	if settings.TelegramServiceChannelID == 0 {
 		panic(fmt.Errorf("missing required settings"))
 	}
 
@@ -138,16 +138,11 @@ func getDBPath() string {
 	return filepath.Join(dataDir, dbFileName)
 }
 
-func sendToTelegramChannel(botToken string, channelID int64, message string) error {
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		return fmt.Errorf("error initializing bot: %v", err)
-	}
-
+func sendToTelegramChannel(bot *tgbotapi.BotAPI, channelID int64, message string) error {
 	// Use plain text mode
 	msg := tgbotapi.NewMessageToChannel(fmt.Sprintf("%d", channelID), message)
 
-	_, err = bot.Send(msg)
+	_, err := bot.Send(msg)
 	if err != nil {
 		return fmt.Errorf("error sending message: %v", err)
 	}
