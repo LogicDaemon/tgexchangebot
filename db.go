@@ -22,37 +22,43 @@ type TableSchema struct {
 	Columns []TableColumn
 }
 
-func getLastUpdateId(db *sql.DB) int {
+func getNextUpdateId(db *sql.DB) int {
 	var lastUpdateID int
 	err := db.QueryRow("SELECT last_update_id FROM bot_settings WHERE id = 1").Scan(&lastUpdateID)
 	if err != nil {
 		log.Printf("Error getting last update ID: %v", err)
-		return 0 // Default to 0 if not found
+		return 0
 	}
-	return lastUpdateID
+	return lastUpdateID + 1
 }
 
 // saveLastUpdateID saves the last processed update ID to the database
-func saveLastUpdateID(db *sql.DB, updateID int) {
+func saveLastUpdateID(db *sql.DB, updateID int) error {
 	log.Printf("Saving last update ID: %d", updateID)
 	_, err := db.Exec("UPDATE bot_settings SET last_update_id = ? WHERE id = 1", updateID)
+	if err == sql.ErrNoRows {
+		// If no row exists, insert a new one
+		_, err = db.Exec("INSERT INTO bot_settings (id, last_update_id) VALUES (1, ?)", updateID)
+	}
 	if err != nil {
 		log.Printf("Error saving last update ID: %v", err)
 	}
+	return err
 }
 
 // getUserReputation gets user reputation from database
 func getUserReputation(db *sql.DB, userID int) (int, error) {
 	var reputation int
 	err := db.QueryRow("SELECT reputation FROM exchangers WHERE userid = ?", userID).Scan(&reputation)
-	if err == sql.ErrNoRows {
-		// User doesn't exist, create with 0 reputation
-		_, err = db.Exec("INSERT INTO exchangers (userid, reputation, name) VALUES (?, 0, '')", userID)
-		if err != nil {
-			return 0, err
-		}
-		return 0, nil
-	}
+	// ToDo: move away
+	// if err == sql.ErrNoRows {
+	// 	// User doesn't exist, create with 0 reputation
+	// 	_, err = db.Exec("INSERT INTO exchangers (userid, reputation, name) VALUES (?, 0, '')", userID)
+	// 	if err != nil {
+	// 		return 0, err
+	// 	}
+	// 	return 0, nil
+	// }
 	return reputation, err
 }
 
@@ -80,6 +86,55 @@ func saveOffer(db *sql.DB, userID int, username string, offer *ParsedOffer, chan
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		userID, username, haveAmount, haveCurrency, wantAmount, wantCurrency, channelID, messageID)
 	return err
+}
+
+type StoredOffer struct {
+	UserID       int
+	Username     string
+	HaveAmount   float64
+	HaveCurrency string
+	WantAmount   float64
+	WantCurrency string
+	ChannelID    int64
+	MessageID    int
+	PostedAt     string
+	Reputation   int64
+}
+
+func getRecentOffers(db *sql.DB, limit int) ([]StoredOffer, error) {
+	rows, err := db.Query(`
+		SELECT o.userid, o.username, o.have_amount, o.have_currency, o.want_amount, o.want_currency, o.channel_id, o.message_id, o.posted_at, e.reputation
+		FROM offers o
+		LEFT JOIN exchangers e ON o.userid = e.userid
+		ORDER BY o.posted_at DESC
+		LIMIT ?`, limit)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("error querying recent offers: %v", err)
+	}
+	defer rows.Close()
+
+	offers := make([]StoredOffer, 0, limit)
+
+	for rows.Next() {
+		var offer StoredOffer
+
+		err := rows.Scan(&offer.UserID,
+			&offer.Username,
+			&offer.HaveAmount, &offer.HaveCurrency,
+			&offer.WantAmount, &offer.WantCurrency,
+			&offer.ChannelID, &offer.MessageID,
+			&offer.PostedAt,
+			&offer.Reputation)
+		if err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+		offers = append(offers, offer)
+	}
+	return offers, nil
 }
 
 // findMatchingOffers finds offers that match the current offer
@@ -121,6 +176,7 @@ func findMatchingOffers(db *sql.DB, offer *ParsedOffer) ([]map[string]interface{
 
 		err := rows.Scan(&userID, &username, &amount, &currency, &reputation)
 		if err != nil {
+			log.Printf("Error scanning row: %v", err)
 			continue
 		}
 
@@ -166,10 +222,10 @@ func getExpectedSchemas() []TableSchema {
 				{Name: "id", Type: "INTEGER", PrimaryKey: true},
 				{Name: "userid", Type: "INTEGER", NotNull: true},
 				{Name: "username", Type: "TEXT", NotNull: true},
-				{Name: "have_amount", Type: "REAL", NotNull: true},
-				{Name: "have_currency", Type: "TEXT", NotNull: true},
-				{Name: "want_amount", Type: "REAL", NotNull: true},
-				{Name: "want_currency", Type: "TEXT", NotNull: true},
+				{Name: "have_amount", Type: "REAL"},
+				{Name: "have_currency", Type: "TEXT"},
+				{Name: "want_amount", Type: "REAL"},
+				{Name: "want_currency", Type: "TEXT"},
 				{Name: "channel_id", Type: "INTEGER", NotNull: true},
 				{Name: "message_id", Type: "INTEGER", NotNull: true},
 				{Name: "posted_at", Type: "TIMESTAMP", DefaultValue: "CURRENT_TIMESTAMP"},
@@ -209,6 +265,7 @@ func getCurrentTableColumns(db *sql.DB, tableName string) ([]TableColumn, error)
 
 		err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey)
 		if err != nil {
+			log.Printf("Error scanning row: %v", err)
 			return nil, err
 		}
 
@@ -310,9 +367,6 @@ func buildCreateTableQuery(schema TableSchema) string {
 
 		if col.PrimaryKey {
 			query.WriteString(" PRIMARY KEY")
-			if col.Type == "INTEGER" {
-				query.WriteString(" AUTOINCREMENT")
-			}
 		}
 
 		if col.NotNull && !col.PrimaryKey {

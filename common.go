@@ -140,7 +140,7 @@ func getDBPath() string {
 
 func sendToTelegramChannel(bot *tgbotapi.BotAPI, channelID int64, message string) error {
 	// Use plain text mode
-	msg := tgbotapi.NewMessageToChannel(fmt.Sprintf("%d", channelID), message)
+	msg := tgbotapi.NewMessage(channelID, message)
 
 	_, err := bot.Send(msg)
 	if err != nil {
