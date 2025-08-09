@@ -138,12 +138,11 @@ func getDBPath() string {
 	return filepath.Join(dataDir, dbFileName)
 }
 
-func sendToTelegramChannel(bot *tgbotapi.BotAPI, channelID int64, message string) error {
+func sendToTelegram(bot *tgbotapi.BotAPI, channelID int64, message string) error {
 	// Use plain text mode
 	msg := tgbotapi.NewMessage(channelID, message)
 
-	_, err := bot.Send(msg)
-	if err != nil {
+	if _, err := bot.Send(msg); err != nil {
 		return fmt.Errorf("error sending message: %v", err)
 	}
 
@@ -160,7 +159,7 @@ func printInstructions() {
 	fmt.Println("   Format:")
 	fmt.Println(`   {
      "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN"
-     }`)
+   }`)
 	fmt.Println("   To obtain, create a Telegram bot by talking to @BotFather and get the token")
 
 	// Settings file
@@ -168,7 +167,7 @@ func printInstructions() {
 	fmt.Printf("   Path: %s\n", getSettingsPath())
 	fmt.Println("   Format:")
 	fmt.Println(`   {
-     "telegram_channel_id": YOUR_CHANNEL_ID_NUMBER
+     "telegram_service_channel_id": YOUR_CHANNEL_ID_NUMBER
    }`)
 	fmt.Println("   To get it, add your bot to the target channel as an administrator,")
 	fmt.Println("   and forward a message from the channel to @userinfobot.")

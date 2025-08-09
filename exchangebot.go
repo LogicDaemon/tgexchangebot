@@ -82,20 +82,10 @@ type BotContext struct {
 	commands map[string]func(message *tgbotapi.Message) error
 }
 
-// formatOfferMessage formats the offer message for posting
-func formatOfferMessage(username string, reputation int, amount float64, currency string, offerType OfferType) string {
-	action := "has"
-	if offerType == OfferTypeBuy {
-		action = "wants"
-	}
-
-	return fmt.Sprintf("@%s [%d] %s %.2f %s [delete]", username, reputation, action, amount, currency)
-}
-
 // createOfferKeyboard creates inline keyboard for offer interactions
-func createOfferKeyboard(userID int, offerID int) tgbotapi.InlineKeyboardMarkup {
+func createOfferKeyboard(userID int) tgbotapi.InlineKeyboardMarkup {
 	contactButton := tgbotapi.NewInlineKeyboardButtonURL("contact", fmt.Sprintf("tg://user?id=%d", userID))
-	feedbackButton := tgbotapi.NewInlineKeyboardButtonData("feedback", fmt.Sprintf("feedback_%d", offerID))
+	feedbackButton := tgbotapi.NewInlineKeyboardButtonData("feedback", fmt.Sprintf("feedback_%d", userID))
 
 	keyboard := tgbotapi.InlineKeyboardMarkup{
 		InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{
@@ -123,19 +113,39 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
 
 	channelID := message.Chat.ID
 
-	// Save offer to database
-	err = saveOffer(ctx.db, message.From.ID, message.From.UserName, offer, channelID, message.MessageID)
+	// Save offer to database (store user's command message ID); we'll update reply_message_id after posting
+	offerID, err := saveOffer(ctx.db, message.From.ID, message.From.UserName, offer, channelID, message.MessageID)
 	if err != nil {
 		log.Printf("Error saving offer: %v", err)
 	}
 
 	// Format and send the offer message
-	offerText := formatOfferMessage(message.From.UserName, reputation, offer.Amount, offer.Currency, offer.Type)
+	var offerText strings.Builder
+	storedOffer := StoredOffer{
+		UserID:     message.From.ID,
+		Username:   message.From.UserName,
+		Reputation: reputation,
+	}
+	if offer.Type == OfferTypeSell {
+		storedOffer.HaveAmount = offer.Amount
+		storedOffer.HaveCurrency = offer.Currency
+	} else {
+		storedOffer.WantAmount = offer.Amount
+		storedOffer.WantCurrency = offer.Currency
+	}
+	writeStoredOffer(storedOffer, &offerText)
 
-	msg := tgbotapi.NewMessage(channelID, offerText)
-	sentMsg, err := ctx.bot.Send(msg)
+	msg := tgbotapi.NewMessage(channelID, offerText.String())
+	sent, err := ctx.bot.Send(msg)
 	if err != nil {
 		return err
+	}
+
+	// Update the offer with the bot's reply message ID
+	if offerID != 0 {
+		if err := updateOfferReplyMessageID(ctx.db, offerID, sent.MessageID); err != nil {
+			ctx.logToTelegramAndConsole(fmt.Errorf("Error updating reply_message_id for offer %d: %w", offerID, err).Error())
+		}
 	}
 
 	// Find and post matching offers
@@ -146,19 +156,13 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
 	}
 
 	for _, match := range matches {
-		matchText := formatOfferMessage(
-			match["username"].(string),
-			match["reputation"].(int),
-			match["amount"].(float64),
-			match["currency"].(string),
-			-offer.Type, // Opposite of the original offer type
-		)
+		var matchesText strings.Builder
+		writeStoredOffer(match, &matchesText)
 
-		keyboard := createOfferKeyboard(match["userid"].(int), sentMsg.MessageID)
-		matchMsg := tgbotapi.NewMessage(channelID, matchText)
+		keyboard := createOfferKeyboard(match.UserID)
+		matchMsg := tgbotapi.NewMessage(channelID, matchesText.String())
 		matchMsg.ReplyMarkup = keyboard
-		_, err = ctx.bot.Send(matchMsg)
-		if err != nil {
+		if _, err = ctx.bot.Send(matchMsg); err != nil {
 			log.Printf("Error sending match: %v", err)
 		}
 	}
@@ -193,7 +197,7 @@ func (ctx *BotContext) handleStatsCommand(message *tgbotapi.Message) error {
 // handleListCommand handles /list command
 func (ctx *BotContext) handleListCommand(message *tgbotapi.Message) error {
 	// Get recent offers
-	offers, err := getRecentOffers(ctx.db, 10)
+	offers, err := getFilteredOffers(ctx.db, 10, "")
 	if err != nil {
 		ctx.logToTelegramAndConsole(fmt.Sprintf("Error getting recent offers: %v", err))
 		return err
@@ -205,32 +209,39 @@ func (ctx *BotContext) handleListCommand(message *tgbotapi.Message) error {
 	}
 
 	var listText strings.Builder
-	listText.WriteString("Recent offers:\n\n")
-
-	for _, offer := range offers {
-		reputation, _ := getUserReputation(ctx.db, offer.UserID)
-
-		listText.WriteString(fmt.Sprintf(
-			"@%s [%d] ",
-			offer.Username,
-			reputation,
-		))
-
-		if offer.HaveAmount > 0 {
-			listText.WriteString(fmt.Sprintf("has %.2f %s ", offer.HaveAmount, offer.HaveCurrency))
-		}
-		if offer.HaveAmount > 0 && offer.WantAmount > 0 {
-			listText.WriteString("and ")
-		}
-		if offer.WantAmount > 0 {
-			listText.WriteString(fmt.Sprintf("wants %.2f %s ", offer.WantAmount, offer.WantCurrency))
-		}
-		listText.WriteString("\n")
-	}
-
+	ctx.formatStoredOffers(offers, &listText)
 	reply := tgbotapi.NewMessage(message.Chat.ID, listText.String())
 	_, err = ctx.bot.Send(reply)
 	return err
+}
+
+// formatStoredOffers formats a list of StoredOffer for display
+func (ctx *BotContext) formatStoredOffers(offers []StoredOffer, listText *strings.Builder) {
+	listText.WriteString("Recent offers:\n\n")
+
+	for _, offer := range offers {
+		writeStoredOffer(offer, listText)
+		listText.WriteString("\n")
+	}
+}
+
+// writeStoredOffer formats a StoredOffer for display
+func writeStoredOffer(offer StoredOffer, listText *strings.Builder) {
+	listText.WriteString(fmt.Sprintf(
+		"@%s [%d] ",
+		offer.Username,
+		offer.Reputation,
+	))
+
+	if offer.HaveAmount > 0 {
+		listText.WriteString(fmt.Sprintf("has %.2f %s ", offer.HaveAmount, offer.HaveCurrency))
+	}
+	if offer.HaveAmount > 0 && offer.WantAmount > 0 {
+		listText.WriteString("and ")
+	}
+	if offer.WantAmount > 0 {
+		listText.WriteString(fmt.Sprintf("wants %.2f %s ", offer.WantAmount, offer.WantCurrency))
+	}
 }
 
 // logToTelegramAndConsole logs messages to both console and Telegram channel
@@ -239,7 +250,7 @@ func (ctx BotContext) logToTelegramAndConsole(message string) {
 	log.Println(message)
 
 	// Send to Telegram channel
-	if err := sendToTelegramChannel(ctx.bot, ctx.settings.TelegramServiceChannelID, message); err != nil {
+	if err := sendToTelegram(ctx.bot, ctx.settings.TelegramServiceChannelID, message); err != nil {
 		log.Printf("Error sending log message to Telegram: %v", err)
 	}
 }
@@ -353,7 +364,7 @@ func main() {
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
 	// Send test message to verify channel connection
-	if err := sendToTelegramChannel(bot, settings.TelegramServiceChannelID, "ExchangeBot started"); err != nil {
+	if err := sendToTelegram(bot, settings.TelegramServiceChannelID, "ExchangeBot started"); err != nil {
 		log.Fatalf("Error sending message to Telegram channel: %v", err)
 	}
 
