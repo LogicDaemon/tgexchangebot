@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"strings"
 )
 
 func getNextUpdateId(db *sql.DB) int {
@@ -31,36 +30,35 @@ func getUserReputation(db *sql.DB, userID int) (reputation int64, err error) {
 	return reputation, err
 }
 
-// saveOffer saves an offer to the database and returns the new offer ID
-func saveOffer(db *sql.DB, userID int, username string, offer *ParsedOffer, channelID int64, messageID int) (int64, error) {
-	var haveAmount, wantAmount float64
-	var haveCurrency, wantCurrency string
+type NewOffer struct {
+	UserID       int
+	Username     string
+	HaveAmount   float64
+	HaveCurrency string
+	WantAmount   float64
+	WantCurrency string
+	ChannelID    int64
+	MessageID    int
+	ReplyID      int64
+}
 
-	if offer.Type == OfferTypeSell {
-		// User has currency and wants to sell it
-		haveAmount = offer.Amount
-		haveCurrency = offer.Currency
-		wantAmount = 0
-		wantCurrency = ""
-	} else {
-		// User wants to buy currency
-		haveAmount = 0
-		haveCurrency = ""
-		wantAmount = offer.Amount
-		wantCurrency = offer.Currency
-	}
+// saveOffer saves an offer to the database and returns the new offer ID
+func saveOffer(db *sql.DB, offer NewOffer) (int64, error) {
 	// Ensure the exchangers table has the user
 	if _, err := db.Exec(`
 		INSERT OR IGNORE INTO exchangers (userid, reputation, name)
-		VALUES (?, 0, ?)`, userID, username); err != nil {
+		VALUES (?, 0, ?)`, offer.UserID, offer.Username); err != nil {
 		return 0, fmt.Errorf("error inserting into exchangers: %w", err)
 	}
 
 	// Insert the offer
 	res, err := db.Exec(`
-		INSERT INTO offers (userid, username, have_amount, have_currency, want_amount, want_currency, channel_id, message_id)
+		INSERT INTO offers (userid, username, have_amount, have_currency, want_amount, want_currency, channel_id, message_id, reply_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		userID, username, haveAmount, haveCurrency, wantAmount, wantCurrency, channelID, messageID)
+		offer.UserID, offer.Username,
+		offer.HaveAmount, offer.HaveCurrency,
+		offer.WantAmount, offer.WantCurrency,
+		offer.ChannelID, offer.MessageID, offer.ReplyID)
 	if err != nil {
 		return 0, err
 	}
@@ -80,6 +78,7 @@ type StoredOffer struct {
 	Reputation   int64
 }
 
+// getFilteredOffers retrieves offers from the database with optional filtering
 func getFilteredOffers(db *sql.DB, limit int, querySuffix string, args ...any) ([]StoredOffer, error) {
 	query := `
 		SELECT o.userid, o.username, o.have_amount, o.have_currency, o.want_amount, o.want_currency, o.channel_id, o.message_id, o.posted_at, e.reputation
@@ -118,7 +117,7 @@ func getFilteredOffers(db *sql.DB, limit int, querySuffix string, args ...any) (
 }
 
 // findMatchingOffers finds offers that match the current offer
-func findMatchingOffers(db *sql.DB, offer *ParsedOffer) ([]StoredOffer, error) {
+func findMatchingOffers(db *sql.DB, offer ParsedOffer) ([]StoredOffer, error) {
 	var colPrefix string
 	if offer.Type == OfferTypeBuy {
 		// User wants to buy, find sellers
@@ -147,12 +146,12 @@ func findMatchingOffers(db *sql.DB, offer *ParsedOffer) ([]StoredOffer, error) {
 
 // tableExists checks if a table exists in the database
 func tableExists(db *sql.DB, tableName string) bool {
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", tableName).Scan(&count)
+	var one int
+	err := db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", tableName).Scan(&one)
 	if err != nil {
 		log.Panicf("error checking if table %s exists: %v", tableName, err)
 	}
-	return count > 0
+	return one == 1
 }
 
 // getDefaultValueForType returns an appropriate default value for a given SQL type
@@ -171,151 +170,41 @@ func getDefaultValueForType(sqlType string) string {
 	}
 }
 
-// updateTableSchema updates a table schema to match the expected schema
-func updateTableSchema(db *sql.DB, expectedSchema TableSchema) {
-	if !tableExists(db, expectedSchema.Name) {
-		log.Printf("Table %s does not exist", expectedSchema.Name)
-		return // Table will be created by CREATE TABLE IF NOT EXISTS
-	}
-
-	log.Printf("Checking schema for table: %s", expectedSchema.Name)
-	// Get current columns
-	currentColumns := getCurrentTableColumns(db, expectedSchema.Name)
-
-	// Check for missing columns and add them
-	for _, expectedCol := range expectedSchema.Columns {
-		if columnExists(currentColumns, expectedCol.Name) {
-			continue
-		}
-		if expectedCol.PrimaryKey {
-			log.Panicf("Primary key column %s is missing in table %s, cannot add it", expectedCol.Name, expectedSchema.Name)
-		}
-		log.Printf("Adding missing column %s to table %s", expectedCol.Name, expectedSchema.Name)
-
-		var alterQuery string
-		sqlNotNullSuffix := ""
-		if expectedCol.NotNull {
-			sqlNotNullSuffix = " NOT NULL"
-		}
-		sqlDefaultSuffix := ""
-		if expectedCol.DefaultValue != "" {
-			sqlDefaultSuffix = fmt.Sprintf(" DEFAULT %s", expectedCol.DefaultValue)
-		} else if expectedCol.NotNull {
-			// For NOT NULL columns without default, we provide a default
-			// so if the column is not used anymore someday, it does not cause failures
-			sqlDefaultSuffix = fmt.Sprintf(" DEFAULT %s", getDefaultValueForType(expectedCol.Type))
-		}
-		alterQuery = fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s %s %s",
-			expectedSchema.Name, expectedCol.Name, expectedCol.Type, sqlNotNullSuffix, sqlDefaultSuffix)
-
-		if _, err := db.Exec(alterQuery); err != nil {
-			log.Panicf("error adding column %s to table %s: %v", expectedCol.Name, expectedSchema.Name, err)
-		}
-		log.Printf("Successfully added column %s to table %s", expectedCol.Name, expectedSchema.Name)
-	}
-}
-
-// buildCreateTableQuery builds a CREATE TABLE query from a TableSchema
-func buildCreateTableQuery(schema TableSchema) string {
-	var query strings.Builder
-	query.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", schema.Name))
-
-	for i, col := range schema.Columns {
-		query.WriteString("\t" + col.Name + " " + col.Type)
-
-		if col.PrimaryKey {
-			query.WriteString(" PRIMARY KEY")
-		}
-
-		if col.NotNull && !col.PrimaryKey {
-			query.WriteString(" NOT NULL")
-		}
-
-		if col.DefaultValue != "" {
-			query.WriteString(" DEFAULT " + col.DefaultValue)
-		}
-
-		// Add special constraints for specific columns
-		if col.Name == "rating" {
-			query.WriteString(" CHECK (rating >= -1 AND rating <= 1)")
-		}
-
-		// Add comma if not the last column
-		if i < len(schema.Columns)-1 {
-			query.WriteString(",")
-		}
-	}
-
-	// Add foreign key constraints
-	if len(schema.ForeignKeys) > 0 {
-		for _, fk := range schema.ForeignKeys {
-			query.WriteString(",\n\tFOREIGN KEY (" + fk.ColumnName + ") REFERENCES " + fk.RefTable + "(" + fk.RefColumn + ")")
-		}
-	}
-
-	query.WriteString("\n);")
-	return query.String()
-}
-
-func initDB(dbPath string) *sql.DB {
-	log.Printf("Initializing database at %s", dbPath)
-	db, err := sql.Open("sqlite3", dbPath)
+// saveReplyMessageID updates reply_message_id for an offer
+func saveReplyMessageID(db *sql.DB, original MessageIndex, replyMessageID int) (int64, error) {
+	r, err := db.Exec(`INSERT INTO command_replies (channel_id, message_id, reply_message_id)
+						VALUES (?, ?, ?)
+				ON CONFLICT(channel_id, message_id) DO
+					UPDATE SET reply_message_id = ? WHERE channel_id = ? AND message_id = ?`,
+		original.ChannelID, original.MessageID, replyMessageID,
+		replyMessageID, original.ChannelID, original.MessageID)
 	if err != nil {
-		log.Panicf("Error opening database: %v", err)
+		return 0, fmt.Errorf("error saving reply_message_id: %w", err)
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			db.Close()
-			log.Printf("Database initialization failed: %v", r)
-			panic(r) // Re-throw the panic after closing the database
-		}
-	}()
-
-	// Get expected schemas
-	expectedSchemas := getExpectedSchemas()
-
-	// Update schemas before creating tables
-	for _, schema := range expectedSchemas {
-		updateTableSchema(db, schema)
-	}
-
-	// Create tables with the expected schema
-	for _, schema := range expectedSchemas {
-		query := buildCreateTableQuery(schema)
-		log.Printf("Executing table creation query for: %s", schema.Name)
-		_, err = db.Exec(query)
-		if err != nil {
-			db.Close()
-			log.Panicf("Error creating table %s: %v", schema.Name, err)
-		}
-	}
-
-	// Verify schemas after creation
-	for _, schema := range expectedSchemas {
-		err = verifyTableSchema(db, schema)
-		if err != nil {
-			log.Panicf("Warning: Schema verification failed for table %s: %v", schema.Name, err)
-		} else {
-			log.Printf("Schema verified for table: %s", schema.Name)
-		}
-	}
-
-	// Set foreign key constraints
-	if _, err = db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
-		log.Panicf("Error enabling foreign keys: %v", err)
-	}
-
-	// Ensure the bot_settings row exists
-	_, err = db.Exec("INSERT OR IGNORE INTO bot_settings (id, schema_version, last_update_id) VALUES (1, ?, 0)", dbSchemaVersion)
-
-	log.Println("Database initialized successfully with schema validation")
-
-	return db
+	return r.LastInsertId()
 }
 
-// updateOfferReplyMessageID updates reply_message_id for an offer
-func updateOfferReplyMessageID(db *sql.DB, offerID int64, replyMessageID int) error {
-	_, err := db.Exec("UPDATE offers SET reply_message_id = ? WHERE id = ?", replyMessageID, offerID)
-	return err
+// findReplyMessageID finds the last reply message ID for a given original message ID
+func findReplyMessageID(db *sql.DB, original MessageIndex) (MessageIndex, error) {
+	var reply MessageIndex
+	err := db.QueryRow(`SELECT reply_message_id FROM command_replies
+	WHERE channel_id = ? AND message_id = ?
+	ORDER BY posted_at DESC
+	LIMIT 1`, original.ChannelID, original.MessageID).Scan(&reply.MessageID)
+	if err == sql.ErrNoRows {
+		return reply, nil // No reply found
+	}
+	if err != nil {
+		return reply, err
+	}
+	reply.ChannelID = original.ChannelID
+	return reply, nil
+}
+
+func deleteOfferByMessage(db *sql.DB, original MessageIndex) error {
+	_, err := db.Exec("DELETE FROM offers WHERE channel_id = ? AND message_id = ?", original.ChannelID, original.MessageID)
+	if err != nil {
+		return fmt.Errorf("error deleting offer: %w", err)
+	}
+	return nil
 }

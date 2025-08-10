@@ -22,9 +22,10 @@ type ForeignKey struct {
 
 // TableSchema represents the expected schema for a table
 type TableSchema struct {
-	Name        string
-	Columns     []TableColumn
-	ForeignKeys []ForeignKey
+	Name           string
+	Columns        []TableColumn
+	ForeignKeys    []ForeignKey
+	SQLConstraints string // Additional SQL suffix for the table (e.g., UNIQUE constraints)
 }
 
 // getExpectedSchemas returns the expected database schemas
@@ -37,7 +38,6 @@ func getExpectedSchemas() []TableSchema {
 				{Name: "schema_version", Type: "INTEGER", NotNull: true},
 				{Name: "last_update_id", Type: "INTEGER", NotNull: true, DefaultValue: "-1"},
 			},
-			ForeignKeys: nil, // No foreign keys for this table
 		},
 		{
 			Name: "exchangers",
@@ -47,7 +47,17 @@ func getExpectedSchemas() []TableSchema {
 				{Name: "name", Type: "TEXT", NotNull: true},
 				{Name: "date_added", Type: "TIMESTAMP", DefaultValue: "CURRENT_TIMESTAMP"},
 			},
-			ForeignKeys: nil, // No foreign keys for this table
+		},
+		{
+			Name: "command_replies",
+			Columns: []TableColumn{
+				{Name: "id", Type: "INTEGER", PrimaryKey: true},
+				{Name: "channel_id", Type: "INTEGER", NotNull: true},
+				{Name: "message_id", Type: "INTEGER", NotNull: true},
+				{Name: "reply_message_id", Type: "INTEGER", NotNull: true},
+				{Name: "posted_at", Type: "TIMESTAMP", DefaultValue: "CURRENT_TIMESTAMP"},
+			},
+			SQLConstraints: "UNIQUE(channel_id, message_id)",
 		},
 		{
 			Name: "offers",
@@ -61,18 +71,20 @@ func getExpectedSchemas() []TableSchema {
 				{Name: "want_currency", Type: "TEXT"},
 				{Name: "channel_id", Type: "INTEGER", NotNull: true},
 				{Name: "message_id", Type: "INTEGER", NotNull: true},
-				{Name: "reply_message_id", Type: "INTEGER"},
+				{Name: "reply_id", Type: "INTEGER"},
 				{Name: "posted_at", Type: "TIMESTAMP", DefaultValue: "CURRENT_TIMESTAMP"},
 			},
 			ForeignKeys: []ForeignKey{
 				{ColumnName: "userid", RefTable: "exchangers", RefColumn: "userid"},
+				{ColumnName: "reply_id", RefTable: "command_replies", RefColumn: "id"},
 			},
+			SQLConstraints: "UNIQUE(channel_id, message_id)",
 		},
 		{
 			Name: "reviews",
 			Columns: []TableColumn{
 				{Name: "id", Type: "INTEGER", PrimaryKey: true},
-				{Name: "offer_id", Type: "INTEGER", NotNull: true},
+				{Name: "offer_id", Type: "INTEGER"},
 				{Name: "reviewer_id", Type: "INTEGER", NotNull: true},
 				{Name: "reviewer_name", Type: "TEXT", NotNull: true},
 				{Name: "reviewee_id", Type: "INTEGER", NotNull: true},

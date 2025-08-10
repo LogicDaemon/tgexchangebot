@@ -27,11 +27,16 @@ type ParsedOffer struct {
 	Currency string
 }
 
+type MessageIndex struct {
+	ChannelID int64
+	MessageID int
+}
+
 // parseOfferCommand parses /buy or /sell commands with amount and currency
-func parseOfferCommand(message *tgbotapi.Message) (*ParsedOffer, error) {
+func parseOfferCommand(message *tgbotapi.Message) (ParsedOffer, error) {
 	parts := strings.Fields(message.CommandArguments())
 	if len(parts) < 2 {
-		return nil, fmt.Errorf("insufficient parameters")
+		return ParsedOffer{}, fmt.Errorf("insufficient parameters")
 	}
 
 	// Command() already returns without the leading '/'
@@ -43,7 +48,7 @@ func parseOfferCommand(message *tgbotapi.Message) (*ParsedOffer, error) {
 	case OfferTypeBuyName:
 		offerType = OfferTypeBuy
 	default:
-		return nil, fmt.Errorf("unknown offer type: %s", command)
+		return ParsedOffer{}, fmt.Errorf("unknown offer type: %s", command)
 	}
 
 	// Parse parts for amount and currency (order-independent, first numeric & first non-numeric)
@@ -62,13 +67,13 @@ func parseOfferCommand(message *tgbotapi.Message) (*ParsedOffer, error) {
 	}
 
 	if amount <= 0 {
-		return nil, fmt.Errorf("invalid amount")
+		return ParsedOffer{}, fmt.Errorf("invalid amount")
 	}
 	if currency == "" {
-		return nil, fmt.Errorf("missing currency")
+		return ParsedOffer{}, fmt.Errorf("missing currency")
 	}
 
-	return &ParsedOffer{
+	return ParsedOffer{
 		Type:     offerType,
 		Amount:   amount,
 		Currency: currency,
@@ -79,7 +84,7 @@ type BotContext struct {
 	bot      *tgbotapi.BotAPI
 	db       *sql.DB
 	settings *Settings
-	commands map[string]func(message *tgbotapi.Message) error
+	commands map[string]func(*tgbotapi.Message, MessageIndex) error
 }
 
 // createOfferKeyboard creates inline keyboard for offer interactions
@@ -95,8 +100,29 @@ func createOfferKeyboard(userID int) tgbotapi.InlineKeyboardMarkup {
 	return keyboard
 }
 
+// sendReply sends a reply message to the original message
+func (ctx *BotContext) sendReply(original *tgbotapi.Message, replyText string) (int64, error) {
+	msg := tgbotapi.NewMessage(original.Chat.ID, replyText)
+	msg.ReplyToMessageID = original.MessageID
+	msg.ReplyMarkup = createOfferKeyboard(original.From.ID)
+	msg.ParseMode = "Markdown"
+
+	sent, err := ctx.bot.Send(msg)
+	if err != nil {
+		return 0, err
+	}
+
+	// Save the reply message ID
+	replyID, err := saveReplyMessageID(ctx.db, MessageIndex{ChannelID: original.Chat.ID,
+		MessageID: original.MessageID}, sent.MessageID)
+	if err != nil {
+		ctx.logToTelegramAndConsole(fmt.Errorf("Error saving reply_message_id: %w", err).Error())
+	}
+	return replyID, nil
+}
+
 // handleBuySellCommand handles /buy command
-func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
+func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update MessageIndex) error {
 	offer, err := parseOfferCommand(message)
 	if err != nil {
 		reply := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Error parsing command: %s", err.Error()))
@@ -113,12 +139,6 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
 
 	channelID := message.Chat.ID
 
-	// Save offer to database (store user's command message ID); we'll update reply_message_id after posting
-	offerID, err := saveOffer(ctx.db, message.From.ID, message.From.UserName, offer, channelID, message.MessageID)
-	if err != nil {
-		log.Printf("Error saving offer: %v", err)
-	}
-
 	// Format and send the offer message
 	var offerText strings.Builder
 	storedOffer := StoredOffer{
@@ -133,19 +153,28 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
 		storedOffer.WantAmount = offer.Amount
 		storedOffer.WantCurrency = offer.Currency
 	}
-	writeStoredOffer(storedOffer, &offerText)
+	storedOfferToStringBuilder(storedOffer, &offerText)
 
-	msg := tgbotapi.NewMessage(channelID, offerText.String())
-	sent, err := ctx.bot.Send(msg)
+	replyID, err := ctx.sendReply(message, offerText.String())
 	if err != nil {
 		return err
 	}
 
-	// Update the offer with the bot's reply message ID
-	if offerID != 0 {
-		if err := updateOfferReplyMessageID(ctx.db, offerID, sent.MessageID); err != nil {
-			ctx.logToTelegramAndConsole(fmt.Errorf("Error updating reply_message_id for offer %d: %w", offerID, err).Error())
-		}
+	// Save offer to database
+	_, err = saveOffer(ctx.db, NewOffer{
+		UserID:       message.From.ID,
+		Username:     message.From.UserName,
+		HaveAmount:   storedOffer.HaveAmount,
+		HaveCurrency: storedOffer.HaveCurrency,
+		WantAmount:   storedOffer.WantAmount,
+		WantCurrency: storedOffer.WantCurrency,
+		ChannelID:    channelID,
+		MessageID:    message.MessageID,
+		ReplyID:      replyID,
+	})
+	if err != nil {
+		ctx.logToTelegramAndConsole(fmt.Sprintf("Error saving offer: %v", err))
+		return err
 	}
 
 	// Find and post matching offers
@@ -157,7 +186,7 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
 
 	for _, match := range matches {
 		var matchesText strings.Builder
-		writeStoredOffer(match, &matchesText)
+		storedOfferToStringBuilder(match, &matchesText)
 
 		keyboard := createOfferKeyboard(match.UserID)
 		matchMsg := tgbotapi.NewMessage(channelID, matchesText.String())
@@ -171,7 +200,7 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message) error {
 }
 
 // handleStatsCommand handles /stats command
-func (ctx *BotContext) handleStatsCommand(message *tgbotapi.Message) error {
+func (ctx *BotContext) handleStatsCommand(message *tgbotapi.Message, update MessageIndex) error {
 	// Get user statistics
 	reputation, err := getUserReputation(ctx.db, message.From.ID)
 	if err != nil {
@@ -189,13 +218,22 @@ func (ctx *BotContext) handleStatsCommand(message *tgbotapi.Message) error {
 
 	statsText := fmt.Sprintf("Your stats:\nReputation: %d\nTotal offers: %d", reputation, offerCount)
 
-	reply := tgbotapi.NewMessage(message.Chat.ID, statsText)
-	_, err = ctx.bot.Send(reply)
+	_, err = ctx.sendReply(message, statsText)
 	return err
 }
 
+// formatStoredOffers formats a list of StoredOffer for display
+func (ctx *BotContext) formatStoredOffers(offers []StoredOffer, listText *strings.Builder) {
+	listText.WriteString("Recent offers:\n\n")
+
+	for _, offer := range offers {
+		storedOfferToStringBuilder(offer, listText)
+		listText.WriteString("\n")
+	}
+}
+
 // handleListCommand handles /list command
-func (ctx *BotContext) handleListCommand(message *tgbotapi.Message) error {
+func (ctx *BotContext) handleListCommand(message *tgbotapi.Message, update MessageIndex) error {
 	// Get recent offers
 	offers, err := getFilteredOffers(ctx.db, 10, "")
 	if err != nil {
@@ -210,23 +248,13 @@ func (ctx *BotContext) handleListCommand(message *tgbotapi.Message) error {
 
 	var listText strings.Builder
 	ctx.formatStoredOffers(offers, &listText)
-	reply := tgbotapi.NewMessage(message.Chat.ID, listText.String())
-	_, err = ctx.bot.Send(reply)
+	// reply := tgbotapi.NewMessage(message.Chat.ID, listText.String())
+	_, err = ctx.sendReply(message, listText.String())
 	return err
 }
 
-// formatStoredOffers formats a list of StoredOffer for display
-func (ctx *BotContext) formatStoredOffers(offers []StoredOffer, listText *strings.Builder) {
-	listText.WriteString("Recent offers:\n\n")
-
-	for _, offer := range offers {
-		writeStoredOffer(offer, listText)
-		listText.WriteString("\n")
-	}
-}
-
-// writeStoredOffer formats a StoredOffer for display
-func writeStoredOffer(offer StoredOffer, listText *strings.Builder) {
+// storedOfferToStringBuilder formats a StoredOffer for display
+func storedOfferToStringBuilder(offer StoredOffer, listText *strings.Builder) {
 	listText.WriteString(fmt.Sprintf(
 		"@%s [%d] ",
 		offer.Username,
@@ -257,9 +285,9 @@ func (ctx BotContext) logToTelegramAndConsole(message string) {
 
 // handleUpdate processes incoming updates from Telegram
 func (ctx *BotContext) handleUpdate(update tgbotapi.Update) (err error) {
-	if update.Message == nil {
-		return nil
-	}
+	// if update.Message == nil {
+	// 	return nil
+	// }
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -272,25 +300,49 @@ func (ctx *BotContext) handleUpdate(update tgbotapi.Update) (err error) {
 		}
 	}()
 
-	message := update.Message
+	var message *tgbotapi.Message
+	if update.Message != nil {
+		message = update.Message
+	} else if update.ChannelPost != nil {
+		message = update.ChannelPost
+	} else if update.EditedMessage != nil {
+		message = update.EditedMessage
+	} else if update.EditedChannelPost != nil {
+		message = update.EditedChannelPost
+	}
+	prevReply, err := findReplyMessageID(ctx.db, MessageIndex{message.Chat.ID, message.MessageID})
+	if err != nil {
+		ctx.logToTelegramAndConsole(fmt.Sprintf("Error finding reply message ID: %v", err))
+		return err
+	}
 
 	// Handle commands
-	if command := message.Command(); command != "" {
-		ctx.logToTelegramAndConsole(fmt.Sprintf(`Received command "%s" from user "%s"`, command, message.From.UserName))
+	command := message.Command()
+	if command == "" {
+		if prevReply.MessageID != 0 {
+			ctx.logToTelegramAndConsole(fmt.Sprintf("Received message without command, deleting message with ID %d", prevReply))
+			delRequest := tgbotapi.NewDeleteMessage(prevReply.ChannelID, prevReply.MessageID)
+			if _, err := ctx.bot.Send(delRequest); err != nil {
+				log.Printf("Error deleting message with ID %d: %v", prevReply, err)
+			}
+			deleteOfferByMessage(ctx.db, prevReply)
+		}
+		return nil
+	}
+	ctx.logToTelegramAndConsole(fmt.Sprintf(`Received command "%s" from user "%s"`, command, message.From.UserName))
 
-		if handler, exists := ctx.commands[command]; exists {
-			if err := handler(message); err != nil {
-				log.Printf("Error handling %s command: %v", command, err)
-			}
-		} else {
-			commandNames := make([]string, 0, len(ctx.commands))
-			for name := range ctx.commands {
-				commandNames = append(commandNames, "/"+name)
-			}
-			reply := tgbotapi.NewMessage(message.Chat.ID, "Unknown command. Available commands: "+strings.Join(commandNames, ", "))
-			if _, err := ctx.bot.Send(reply); err != nil {
-				log.Printf("Error sending reply: %v", err)
-			}
+	if handler, exists := ctx.commands[command]; exists {
+		if err := handler(message, prevReply); err != nil {
+			log.Printf("Error handling %s command: %v", command, err)
+		}
+	} else {
+		commandNames := make([]string, 0, len(ctx.commands))
+		for name := range ctx.commands {
+			commandNames = append(commandNames, "/"+name)
+		}
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Unknown command. Available commands: "+strings.Join(commandNames, ", "))
+		if _, err := ctx.bot.Send(reply); err != nil {
+			log.Printf("Error sending reply: %v", err)
 		}
 	}
 
@@ -298,8 +350,7 @@ func (ctx *BotContext) handleUpdate(update tgbotapi.Update) (err error) {
 }
 
 // handleCallbackQuery processes callback queries from inline buttons
-func (ctx *BotContext) handleCallbackQuery(update tgbotapi.Update) error {
-	callback := update.CallbackQuery
+func (ctx *BotContext) handleCallbackQuery(callback *tgbotapi.CallbackQuery) error {
 	if strings.HasPrefix(callback.Data, "feedback_") {
 		// Handle feedback button press
 		response := tgbotapi.CallbackConfig{
@@ -324,7 +375,7 @@ func (ctx *BotContext) handleUpdates() {
 		log.Fatalf("Error getting updates channel: %v", err)
 	}
 
-	ctx.commands = map[string]func(message *tgbotapi.Message) error{
+	ctx.commands = map[string]func(*tgbotapi.Message, MessageIndex) error{
 		OfferTypeBuyName:  ctx.handleBuySellCommand,
 		OfferTypeSellName: ctx.handleBuySellCommand,
 		"stats":           ctx.handleStatsCommand,
@@ -332,15 +383,15 @@ func (ctx *BotContext) handleUpdates() {
 	}
 
 	for update := range updates {
-		var err error
-		if update.Message != nil {
-			err = ctx.handleUpdate(update)
+		if update.Message != nil || update.ChannelPost != nil {
+			if err := ctx.handleUpdate(update); err != nil {
+				log.Printf("Error %v handling update %v", err, update)
+			}
 		}
 		if update.CallbackQuery != nil {
-			err = ctx.handleCallbackQuery(update)
-		}
-		if err != nil {
-			log.Printf("Error %v handling update %v", err, update)
+			if err := ctx.handleCallbackQuery(update.CallbackQuery); err != nil {
+				log.Printf("Error %v handling callback query %v", err, update)
+			}
 		}
 		if err := saveLastUpdateID(ctx.db, update.UpdateID); err != nil {
 			log.Printf("Error saving last update ID: %v", err)

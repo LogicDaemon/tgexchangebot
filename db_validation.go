@@ -53,6 +53,28 @@ func columnExists(columns []TableColumn, columnName string) bool {
 	return false
 }
 
+// foreignKeyExists checks if a foreign key exists in a table for the given
+// source column referencing the specified destination table and column.
+func foreignKeyExists(db *sql.DB, tableName, columnName, refTable, refColumn string) bool {
+	// Use the table-valued PRAGMA so we can filter directly in SQL.
+	// Columns are: id, seq, "table", "from", "to", on_update, on_delete, match
+	// Note: quoting "table", "from", "to" avoids keyword conflicts.
+	var one int
+	err := db.QueryRow(
+		`SELECT 1 FROM pragma_foreign_key_list(?)
+		 WHERE "from" = ? AND "table" = ? AND "to" = ?
+		 LIMIT 1`,
+		tableName, columnName, refTable, refColumn,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false
+	}
+	if err != nil {
+		log.Panicf("error checking foreign keys for table %s: %v", tableName, err)
+	}
+	return one == 1
+}
+
 // verifyTableSchema verifies that a table has the expected schema
 func verifyTableSchema(db *sql.DB, expectedSchema TableSchema) error {
 	currentColumns := getCurrentTableColumns(db, expectedSchema.Name)
