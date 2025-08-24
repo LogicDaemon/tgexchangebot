@@ -7,88 +7,140 @@ import (
 	"strings"
 )
 
-// updateTableSchema updates a table schema to match the expected schema
-func updateTableSchema(db *sql.DB, expectedSchema TableSchema) {
-	if !tableExists(db, expectedSchema.Name) {
-		log.Printf("Table %s does not exist", expectedSchema.Name)
-		return // Table will be created by CREATE TABLE IF NOT EXISTS
+// getSavedTableConstraints returns the stored SQL constraints for a table from table_settings.
+func getSavedTableConstraints(db *sql.DB, tableName string) (string, error) {
+	var constraints string
+	err := db.QueryRow("SELECT sql_constraints FROM table_settings WHERE table_name = ?",
+		tableName).Scan(&constraints)
+	if err == sql.ErrNoRows {
+		return "", nil
 	}
-
-	log.Printf("Checking schema for table: %s", expectedSchema.Name)
-	// Get current columns
-	currentColumns := getCurrentTableColumns(db, expectedSchema.Name)
-
-	var checkSuffix bool
-	// Check for missing columns and add them
-	for _, expectedCol := range expectedSchema.Columns {
-		if columnExists(currentColumns, expectedCol.Name) {
-			continue
-		}
-		checkSuffix = true
-		if expectedCol.PrimaryKey {
-			log.Panicf("Primary key column %s is missing in table %s, cannot add it", expectedCol.Name, expectedSchema.Name)
-		}
-		log.Printf("Adding missing column %s to table %s", expectedCol.Name, expectedSchema.Name)
-
-		var alterQuery string
-		sqlNotNullSuffix := ""
-		if expectedCol.NotNull {
-			sqlNotNullSuffix = " NOT NULL"
-		}
-		sqlDefaultSuffix := ""
-		if expectedCol.DefaultValue != "" {
-			sqlDefaultSuffix = fmt.Sprintf(" DEFAULT %s", expectedCol.DefaultValue)
-		} else if expectedCol.NotNull {
-			// For NOT NULL columns without default, we provide a default
-			// so if the column is not used anymore someday, it does not cause failures
-			sqlDefaultSuffix = fmt.Sprintf(" DEFAULT %s", getDefaultValueForType(expectedCol.Type))
-		}
-		alterQuery = fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s %s %s",
-			expectedSchema.Name, expectedCol.Name, expectedCol.Type, sqlNotNullSuffix, sqlDefaultSuffix)
-
-		if _, err := db.Exec(alterQuery); err != nil {
-			log.Panicf("error adding column %s to table %s: %v", expectedCol.Name, expectedSchema.Name, err)
-		}
-		log.Printf("Successfully added column %s to table %s", expectedCol.Name, expectedSchema.Name)
+	if err != nil {
+		return "", err
 	}
+	return constraints, nil
+}
 
-	// Check for missing foreign keys
-	for _, fk := range expectedSchema.ForeignKeys {
-		if foreignKeyExists(db, expectedSchema.Name, fk.ColumnName, fk.RefTable, fk.RefColumn) {
-			continue
-		}
-		checkSuffix = true
-		log.Printf("Adding missing foreign key %s to table %s", fk.ColumnName, expectedSchema.Name)
-		query := fmt.Sprintf("ALTER TABLE %s ADD FOREIGN KEY (%s) REFERENCES %s(%s)",
-			expectedSchema.Name, fk.ColumnName, fk.RefTable, fk.RefColumn)
-		if _, err := db.Exec(query); err != nil {
-			log.Panicf("error adding foreign key %s to table %s: %v", fk.ColumnName, expectedSchema.Name, err)
-		}
-		log.Printf("Successfully added foreign key %s to table %s", fk.ColumnName, expectedSchema.Name)
-	}
-
-	if !checkSuffix {
-		return
-	}
-
-	// Check for additional SQL suffix (e.g., UNIQUE constraints)
-	if expectedSchema.SQLConstraints != "" {
-		log.Printf("Adding additional SQL suffix to table %s: %s", expectedSchema.Name, expectedSchema.SQLConstraints)
-		query := fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s", expectedSchema.Name, expectedSchema.SQLConstraints)
-		if _, err := db.Exec(query); err != nil {
-			log.Panicf("error adding SQL suffix to table %s: %v", expectedSchema.Name, err)
-		}
-		log.Printf("Successfully added SQL suffix to table %s", expectedSchema.Name)
+// upsertSavedTableConstraints inserts or updates the constraints for a table in table_settings.
+func upsertSavedTableConstraints(db *sql.DB, tableName, constraints string) {
+	// Use INSERT OR REPLACE to upsert by primary key (table_name)
+	_, err := db.Exec(
+		"INSERT OR REPLACE INTO table_settings (table_name, sql_constraints) VALUES (?, ?)",
+		tableName, constraints,
+	)
+	if err != nil {
+		log.Panicf("WARNING: Failed to upsert table_settings for %s: %v", tableName, err)
 	}
 }
 
-// buildCreateTableQuery builds a CREATE TABLE query from a TableSchema
-func buildCreateTableQuery(schema TableSchema) string {
+// ensureParentUniqueIndexes ensures that referenced parent columns have a UNIQUE index,
+// which satisfies SQLite's requirement that parent keys be PRIMARY KEY or UNIQUE.
+func ensureParentUniqueIndexes(db *sql.DB, schemas []TableSchema) {
+	seen := make(map[string]struct{})
+	for _, schema := range schemas {
+		for _, col := range schema.Columns {
+			if col.RefTable == "" || col.RefColumn == "" {
+				continue
+			}
+			key := col.RefTable + "." + col.RefColumn
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+
+			idxName := fmt.Sprintf("uq_%s_%s", col.RefTable, col.RefColumn)
+			stmt := fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS %s ON %s(%s)", idxName, col.RefTable, col.RefColumn)
+			if _, err := db.Exec(stmt); err != nil {
+				log.Printf("WARNING: Could not ensure unique index %s on %s(%s): %v", idxName, col.RefTable, col.RefColumn, err)
+			}
+		}
+	}
+}
+
+// updateTableSchema updates a table schema to match the expected schema
+func updateTableSchema(db *sql.DB, schema TableSchema) {
+	log.Printf("Checking schema for table: %s", schema.Name)
+	// Get current columns
+	currentColumns := getCurrentTableColumns(db, schema.Name)
+
+	// Check for missing columns and add them
+	for _, expectedCol := range schema.Columns {
+		if columnExists(currentColumns, expectedCol.Name) {
+			continue
+		}
+		if expectedCol.PrimaryKey {
+			log.Panicf("Primary key column %s is missing in table %s, cannot add it", expectedCol.Name, schema.Name)
+		}
+		log.Printf("Adding missing column %s to table %s", expectedCol.Name, schema.Name)
+
+		// Compose column definition respecting SQLite ALTER TABLE ADD COLUMN constraints.
+		// If this column declares a foreign key, inline the REFERENCES clause here because
+		// SQLite does not support "ALTER TABLE ... ADD FOREIGN KEY ..." later.
+		fkClause := ""
+		if expectedCol.RefTable != "" && expectedCol.RefColumn != "" {
+			fkClause = fmt.Sprintf(" REFERENCES %s(%s)", expectedCol.RefTable, expectedCol.RefColumn)
+		}
+
+		colDef := fmt.Sprintf("%s %s", expectedCol.Name, expectedCol.Type)
+		if fkClause != "" {
+			colDef += fkClause
+		}
+		if expectedCol.NotNull {
+			colDef += " NOT NULL"
+		}
+		if expectedCol.DefaultValue != "" {
+			colDef += fmt.Sprintf(" DEFAULT %s", expectedCol.DefaultValue)
+		} else if expectedCol.NotNull {
+			// For NOT NULL columns without default, provide a safe default to satisfy existing rows
+			colDef += fmt.Sprintf(" DEFAULT %s", getDefaultValueForType(expectedCol.Type))
+		}
+
+		alterQuery := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", schema.Name, colDef)
+
+		if _, err := db.Exec(alterQuery); err != nil {
+			log.Panicf("error adding column %s to table %s: %v", expectedCol.Name, schema.Name, err)
+		}
+		log.Printf("Successfully added column %s to table %s", expectedCol.Name, schema.Name)
+	}
+
+	// Check for missing foreign keys (cannot be added post-hoc in SQLite)
+	for _, col := range schema.Columns {
+		if col.RefTable == "" || col.RefColumn == "" {
+			continue
+		}
+		if foreignKeyExists(db, schema.Name, col.Name, col.RefTable, col.RefColumn) {
+			continue
+		}
+		log.Printf("WARNING: SQLite cannot add a foreign key on existing table %s.%s -> %s(%s).",
+			schema.Name, col.Name, col.RefTable, col.RefColumn)
+	}
+
+	// Compare stored table-level constraints with expected ones (if table_settings exists)
+	if tableExists(db, "table_settings") {
+		stored, err := getSavedTableConstraints(db, schema.Name)
+		if err == nil {
+			if stored != schema.SQLConstraints {
+				log.Printf("WARNING: Stored SQL constraints for table %s differ. Stored: %q, Expected: %q",
+					schema.Name, stored, schema.SQLConstraints)
+			}
+		} else {
+			log.Printf("WARNING: Could not read stored constraints for table %s: %v", schema.Name, err)
+		}
+	}
+}
+
+// createTable builds a CREATE TABLE query from a TableSchema, returns true if the table was created
+func createTable(db *sql.DB, schema TableSchema) bool {
 	var query strings.Builder
 	query.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", schema.Name))
 
 	for i, col := range schema.Columns {
 		query.WriteString("\t" + col.Name + " " + col.Type)
+
+		// Inline REFERENCES for column-level foreign keys
+		if col.RefTable != "" && col.RefColumn != "" {
+			query.WriteString(" REFERENCES " + col.RefTable + "(" + col.RefColumn + ")")
+		}
 
 		if col.PrimaryKey {
 			query.WriteString(" PRIMARY KEY")
@@ -113,17 +165,36 @@ func buildCreateTableQuery(schema TableSchema) string {
 		}
 	}
 
-	// Add foreign key constraints
-	if len(schema.ForeignKeys) > 0 {
-		for _, fk := range schema.ForeignKeys {
-			query.WriteString(",\n\tFOREIGN KEY (" + fk.ColumnName + ") REFERENCES " + fk.RefTable + "(" + fk.RefColumn + ")")
-		}
-	}
+	// Add table-level constraints (like UNIQUE)
 	if schema.SQLConstraints != "" {
-		query.WriteString("\n" + schema.SQLConstraints)
+		query.WriteString(",\n\t" + schema.SQLConstraints)
 	}
 	query.WriteString("\n);")
-	return query.String()
+
+	log.Printf("Executing table creation query for: %s", schema.Name)
+	r, err := db.Exec(query.String())
+	if err != nil {
+		log.Panicf("Error creating table %s: %v", schema.Name, err)
+	}
+	liid, err := r.LastInsertId()
+	if err != nil {
+		log.Printf("Error getting LastInsertId for table %s: %v", schema.Name, err)
+	}
+	raff, err := r.RowsAffected()
+	if err != nil {
+		log.Printf("Error getting RowsAffected for table %s: %v", schema.Name, err)
+	}
+	log.Printf("Result of creating table %s: %v %v", schema.Name, liid, raff)
+	// Short return false if table existed already
+	if rows, err := r.RowsAffected(); err == nil {
+		if rows == 0 {
+			return false
+		}
+	}
+
+	// After creating the table, persist its constraints in table_settings
+	upsertSavedTableConstraints(db, schema.Name, schema.SQLConstraints)
+	return true
 }
 
 // initDB initializes the database and creates/updates tables
@@ -147,17 +218,8 @@ func initDB(dbPath string) *sql.DB {
 
 	// Update schemas before creating tables
 	for _, schema := range expectedSchemas {
-		updateTableSchema(db, schema)
-	}
-
-	// Create tables with the expected schema
-	for _, schema := range expectedSchemas {
-		query := buildCreateTableQuery(schema)
-		log.Printf("Executing table creation query for: %s", schema.Name)
-		_, err = db.Exec(query)
-		if err != nil {
-			db.Close()
-			log.Panicf("Error creating table %s: %v", schema.Name, err)
+		if !createTable(db, schema) {
+			updateTableSchema(db, schema)
 		}
 	}
 
@@ -170,6 +232,9 @@ func initDB(dbPath string) *sql.DB {
 			log.Printf("Schema verified for table: %s", schema.Name)
 		}
 	}
+
+	// Ensure parent columns referenced by foreign keys have UNIQUE indexes
+	ensureParentUniqueIndexes(db, expectedSchemas)
 
 	// Set foreign key constraints
 	if _, err = db.Exec("PRAGMA foreign_keys = ON;"); err != nil {

@@ -54,7 +54,7 @@ func saveOffer(db *sql.DB, offer NewOffer) (int64, error) {
 	// Insert the offer
 	res, err := db.Exec(`
 		INSERT INTO offers (userid, username, have_amount, have_currency, want_amount, want_currency, channel_id, message_id, reply_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		offer.UserID, offer.Username,
 		offer.HaveAmount, offer.HaveCurrency,
 		offer.WantAmount, offer.WantCurrency,
@@ -148,6 +148,9 @@ func findMatchingOffers(db *sql.DB, offer ParsedOffer) ([]StoredOffer, error) {
 func tableExists(db *sql.DB, tableName string) bool {
 	var one int
 	err := db.QueryRow("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", tableName).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false
+	}
 	if err != nil {
 		log.Panicf("error checking if table %s exists: %v", tableName, err)
 	}

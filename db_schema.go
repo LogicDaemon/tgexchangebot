@@ -11,26 +11,27 @@ type TableColumn struct {
 	NotNull      bool
 	DefaultValue string
 	PrimaryKey   bool
-}
-
-// ForeignKey represents a foreign key constraint
-type ForeignKey struct {
-	ColumnName string
-	RefTable   string
-	RefColumn  string
+	RefTable     string
+	RefColumn    string
 }
 
 // TableSchema represents the expected schema for a table
 type TableSchema struct {
 	Name           string
 	Columns        []TableColumn
-	ForeignKeys    []ForeignKey
 	SQLConstraints string // Additional SQL suffix for the table (e.g., UNIQUE constraints)
 }
 
 // getExpectedSchemas returns the expected database schemas
 func getExpectedSchemas() []TableSchema {
 	return []TableSchema{
+		{
+			Name: "table_settings",
+			Columns: []TableColumn{
+				{Name: "table_name", Type: "TEXT", PrimaryKey: true},
+				{Name: "sql_constraints", Type: "TEXT", NotNull: true, DefaultValue: "''"},
+			},
+		},
 		{
 			Name: "bot_settings",
 			Columns: []TableColumn{
@@ -63,7 +64,7 @@ func getExpectedSchemas() []TableSchema {
 			Name: "offers",
 			Columns: []TableColumn{
 				{Name: "id", Type: "INTEGER", PrimaryKey: true},
-				{Name: "userid", Type: "INTEGER", NotNull: true},
+				{Name: "userid", Type: "INTEGER", NotNull: true, RefTable: "exchangers", RefColumn: "userid"},
 				{Name: "username", Type: "TEXT", NotNull: true},
 				{Name: "have_amount", Type: "REAL"},
 				{Name: "have_currency", Type: "TEXT"},
@@ -71,12 +72,8 @@ func getExpectedSchemas() []TableSchema {
 				{Name: "want_currency", Type: "TEXT"},
 				{Name: "channel_id", Type: "INTEGER", NotNull: true},
 				{Name: "message_id", Type: "INTEGER", NotNull: true},
-				{Name: "reply_id", Type: "INTEGER"},
+				{Name: "reply_id", Type: "INTEGER", RefTable: "command_replies", RefColumn: "id"},
 				{Name: "posted_at", Type: "TIMESTAMP", DefaultValue: "CURRENT_TIMESTAMP"},
-			},
-			ForeignKeys: []ForeignKey{
-				{ColumnName: "userid", RefTable: "exchangers", RefColumn: "userid"},
-				{ColumnName: "reply_id", RefTable: "command_replies", RefColumn: "id"},
 			},
 			SQLConstraints: "UNIQUE(channel_id, message_id)",
 		},
@@ -84,19 +81,14 @@ func getExpectedSchemas() []TableSchema {
 			Name: "reviews",
 			Columns: []TableColumn{
 				{Name: "id", Type: "INTEGER", PrimaryKey: true},
-				{Name: "offer_id", Type: "INTEGER"},
-				{Name: "reviewer_id", Type: "INTEGER", NotNull: true},
+				{Name: "offer_id", Type: "INTEGER", RefTable: "offers", RefColumn: "id"},
+				{Name: "reviewer_id", Type: "INTEGER", NotNull: true, RefTable: "exchangers", RefColumn: "userid"},
 				{Name: "reviewer_name", Type: "TEXT", NotNull: true},
-				{Name: "reviewee_id", Type: "INTEGER", NotNull: true},
+				{Name: "reviewee_id", Type: "INTEGER", NotNull: true, RefTable: "exchangers", RefColumn: "userid"},
 				{Name: "reviewee_name", Type: "TEXT", NotNull: true},
 				{Name: "comment", Type: "TEXT"},
 				{Name: "rating", Type: "INTEGER", NotNull: true},
 				{Name: "posted_at", Type: "TIMESTAMP", DefaultValue: "CURRENT_TIMESTAMP"},
-			},
-			ForeignKeys: []ForeignKey{
-				{ColumnName: "offer_id", RefTable: "offers", RefColumn: "id"},
-				{ColumnName: "reviewer_id", RefTable: "exchangers", RefColumn: "userid"},
-				{ColumnName: "reviewee_id", RefTable: "exchangers", RefColumn: "userid"},
 			},
 		},
 	}

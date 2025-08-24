@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 )
@@ -61,7 +63,7 @@ func parseOfferCommand(message *tgbotapi.Message) (ParsedOffer, error) {
 			}
 		}
 		if currency == "" { // capture first non-numeric token as currency
-			currency = strings.ToUpper(part)
+			currency = part
 		}
 	}
 
@@ -72,10 +74,16 @@ func parseOfferCommand(message *tgbotapi.Message) (ParsedOffer, error) {
 		return ParsedOffer{}, fmt.Errorf("missing currency")
 	}
 
+	// Normalize currency (aliases and regex)
+	normCurr, ok := normalizeCurrency(currency)
+	if !ok {
+		return ParsedOffer{}, fmt.Errorf("unknown currency: %s", currency)
+	}
+
 	return ParsedOffer{
 		Type:     offerType,
 		Amount:   amount,
-		Currency: currency,
+		Currency: normCurr,
 	}, nil
 }
 
@@ -84,6 +92,7 @@ type BotContext struct {
 	db       *sql.DB
 	settings *Settings
 	commands map[string]func(*tgbotapi.Message, MessageIndex) error
+	rates    *tbcRateCache
 }
 
 // createOfferKeyboard creates inline keyboard for offer interactions
@@ -103,8 +112,11 @@ func createOfferKeyboard(userID int) tgbotapi.InlineKeyboardMarkup {
 func (ctx *BotContext) sendReply(original *tgbotapi.Message, replyText string) (int64, error) {
 	msg := tgbotapi.NewMessage(original.Chat.ID, replyText)
 	msg.ReplyToMessageID = original.MessageID
-	msg.ReplyMarkup = createOfferKeyboard(original.From.ID)
-	msg.ParseMode = "Markdown"
+	// Some channel posts may have nil From; only attach keyboard when we have a user ID
+	if original.From != nil {
+		msg.ReplyMarkup = createOfferKeyboard(original.From.ID)
+	}
+	// Avoid Markdown/HTML parse errors by sending plain text
 
 	sent, err := ctx.bot.Send(msg)
 	if err != nil {
@@ -124,9 +136,15 @@ func (ctx *BotContext) sendReply(original *tgbotapi.Message, replyText string) (
 func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update MessageIndex) error {
 	offer, err := parseOfferCommand(message)
 	if err != nil {
-		reply := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf("Error parsing command: %s", err.Error()))
-		_, err = ctx.bot.Send(reply)
-		return err
+		cmd := message.Command() // "buy" or "sell"
+		help := fmt.Sprintf(
+			"Error parsing command: %s\n\nUsage:\n/%s <amount> <CURRENCY>\n/%s <CURRENCY> <amount>\n\nExamples:\n- /%s $ 100\n- /%s 20 лар\n\n%s\n",
+			err.Error(), cmd, cmd, cmd, cmd, optionsForError(),
+		)
+		reply := tgbotapi.NewMessage(message.Chat.ID, help)
+		reply.ReplyToMessageID = message.MessageID
+		_, sendErr := ctx.bot.Send(reply)
+		return sendErr
 	}
 
 	// Get user reputation
@@ -138,7 +156,11 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update Me
 
 	channelID := message.Chat.ID
 
-	// Format and send the offer message
+	// If only one side provided, compute the other using TBC conversions
+	// For simplicity, interpret:
+	// - /sell <amount> <CUR>: user has <amount> <CUR>; compute want in default counter currency
+	// - /buy <amount> <CUR>: user wants <amount> <CUR>; compute have in default counter currency
+
 	storedOffer := StoredOffer{
 		UserID:     message.From.ID,
 		Username:   message.From.UserName,
@@ -147,9 +169,25 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update Me
 	if offer.Type == OfferTypeSell {
 		storedOffer.HaveAmount = offer.Amount
 		storedOffer.HaveCurrency = offer.Currency
+		// compute Want*
+		if storedOffer.WantAmount == 0 || storedOffer.WantCurrency == "" {
+			otherCur, otherAmt, convErr := ctx.rates.computeCounterAmount(storedOffer.HaveCurrency, storedOffer.HaveAmount, offer.Type)
+			if convErr == nil {
+				storedOffer.WantCurrency = otherCur
+				storedOffer.WantAmount = otherAmt
+			}
+		}
 	} else {
 		storedOffer.WantAmount = offer.Amount
 		storedOffer.WantCurrency = offer.Currency
+		// compute Have*
+		if storedOffer.HaveAmount == 0 || storedOffer.HaveCurrency == "" {
+			otherCur, otherAmt, convErr := ctx.rates.computeCounterAmount(storedOffer.WantCurrency, storedOffer.WantAmount, offer.Type)
+			if convErr == nil {
+				storedOffer.HaveCurrency = otherCur
+				storedOffer.HaveAmount = otherAmt
+			}
+		}
 	}
 	offerText := storedOfferToStringBuilder(nil, storedOffer)
 
@@ -250,6 +288,58 @@ func (ctx *BotContext) handleListCommand(message *tgbotapi.Message, update Messa
 	return err
 }
 
+// handleRatesCommand handles /rates command to dump current rates and their age
+func (ctx *BotContext) handleRatesCommand(message *tgbotapi.Message, update MessageIndex) error {
+	if ctx.rates == nil {
+		reply := tgbotapi.NewMessage(message.Chat.ID, "Rates cache is not initialized")
+		_, err := ctx.bot.Send(reply)
+		return err
+	}
+	// If user asked to refresh, perform a blocking full refresh (no timeout) then dump
+	args := strings.TrimSpace(message.CommandArguments())
+	if args == "refresh" {
+		// Synchronously refresh with no timeout
+		done := make(chan error, 1)
+		ctx.rates.reqCh <- refreshReq{timeout: 0, respCh: done}
+		if err := <-done; err != nil {
+			_, _ = ctx.sendReply(message, "Refresh failed: "+err.Error())
+			return nil
+		}
+	}
+	base, cacheTS, rates := ctx.rates.snapshot()
+	var sb strings.Builder
+	sb.WriteString("Rates (base=" + base + ")\n")
+	sb.WriteString("Cache: ")
+	if cacheTS.IsZero() {
+		sb.WriteString("never\n")
+	} else {
+		sb.WriteString(cacheTS.Format(time.RFC3339))
+		sb.WriteString("\n")
+	}
+	// stable order by code
+	codes := make([]string, 0, len(rates))
+	for code := range rates {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	now := time.Now()
+	for _, code := range codes {
+		r := rates[code]
+		age := "never"
+		if !r.LastUpdated.IsZero() {
+			d := now.Sub(r.LastUpdated).Round(time.Minute)
+			// format hh:mm
+			h := int(d.Hours())
+			m := int(d.Minutes()) % 60
+			age = fmt.Sprintf("%02d:%02d", h, m)
+		}
+		// USD: buy/sell and age
+		sb.WriteString(fmt.Sprintf("%s: buy=%.4f sell=%.4f age=%s\n", code, r.Buy, r.Sell, age))
+	}
+	_, err := ctx.sendReply(message, sb.String())
+	return err
+}
+
 // storedOfferToStringBuilder formats a StoredOffer for display
 func storedOfferToStringBuilder(sb *strings.Builder, offer StoredOffer) *strings.Builder {
 	if sb == nil {
@@ -262,13 +352,13 @@ func storedOfferToStringBuilder(sb *strings.Builder, offer StoredOffer) *strings
 	))
 
 	if offer.HaveAmount > 0 {
-		sb.WriteString(fmt.Sprintf("has %.2f %s ", offer.HaveAmount, offer.HaveCurrency))
+		sb.WriteString(fmt.Sprintf("has %.2f %s ", offer.HaveAmount, formatCodeWithRep(offer.HaveCurrency)))
 	}
 	if offer.HaveAmount > 0 && offer.WantAmount > 0 {
 		sb.WriteString("and ")
 	}
 	if offer.WantAmount > 0 {
-		sb.WriteString(fmt.Sprintf("wants %.2f %s ", offer.WantAmount, offer.WantCurrency))
+		sb.WriteString(fmt.Sprintf("wants %.2f %s ", offer.WantAmount, formatCodeWithRep(offer.WantCurrency)))
 	}
 	return sb
 }
@@ -330,7 +420,12 @@ func (ctx *BotContext) handleUpdate(update tgbotapi.Update) (err error) {
 		}
 		return nil
 	}
-	ctx.logToTelegramAndConsole(fmt.Sprintf(`Received command "%s" from user "%s"`, command, message.From.UserName))
+	// message.From can be nil for channel posts; avoid nil dereference in logs
+	fromUser := ""
+	if message.From != nil {
+		fromUser = message.From.UserName
+	}
+	log.Printf(`Received command "%s" from user "%s"`, command, fromUser)
 
 	if handler, exists := ctx.commands[command]; exists {
 		if err := handler(message, prevReply); err != nil {
@@ -381,6 +476,7 @@ func (ctx *BotContext) handleUpdates() {
 		OfferTypeSellName: ctx.handleBuySellCommand,
 		"stats":           ctx.handleStatsCommand,
 		"list":            ctx.handleListCommand,
+		"rates":           ctx.handleRatesCommand,
 	}
 
 	for update := range updates {
@@ -415,6 +511,8 @@ func main() {
 	bot.Debug = false
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
+	rates := initCurrencyRates(secrets.TBCApiKey)
+
 	// Send test message to verify channel connection
 	if err := sendToTelegram(bot, settings.TelegramServiceChannelID, "ExchangeBot started"); err != nil {
 		log.Fatalf("Error sending message to Telegram channel: %v", err)
@@ -424,6 +522,7 @@ func main() {
 		bot:      bot,
 		db:       db,
 		settings: settings,
+		rates:    rates,
 	}
 
 	// Start message handler

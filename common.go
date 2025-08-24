@@ -15,6 +15,7 @@ import (
 // Secrets holds only the authentication secrets for the bot
 type Secrets struct {
 	TelegramBotToken string `json:"telegram_bot_token"`
+	TBCApiKey        string `json:"tbcBankApiKey"`
 }
 
 // Settings holds the configuration settings for the bot
@@ -158,8 +159,9 @@ func printInstructions() {
 	fmt.Printf("   Path: %s\n", getDefaultSecretsPath())
 	fmt.Println("   Format:")
 	fmt.Println(`   {
-     "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN"
-   }`)
+		 "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+		 "tbcBankApiKey": "YOUR_TBC_API_KEY"
+	 }`)
 	fmt.Println("   To obtain, create a Telegram bot by talking to @BotFather and get the token")
 
 	// Settings file
