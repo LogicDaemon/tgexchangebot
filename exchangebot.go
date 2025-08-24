@@ -20,7 +20,6 @@ const (
 	OfferTypeSellName           = "sell"
 )
 
-// ParsedOffer represents a parsed buy/sell command
 type ParsedOffer struct {
 	Type     OfferType
 	Amount   float64
@@ -140,7 +139,6 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update Me
 	channelID := message.Chat.ID
 
 	// Format and send the offer message
-	var offerText strings.Builder
 	storedOffer := StoredOffer{
 		UserID:     message.From.ID,
 		Username:   message.From.UserName,
@@ -153,7 +151,7 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update Me
 		storedOffer.WantAmount = offer.Amount
 		storedOffer.WantCurrency = offer.Currency
 	}
-	storedOfferToStringBuilder(storedOffer, &offerText)
+	offerText := storedOfferToStringBuilder(nil, storedOffer)
 
 	replyID, err := ctx.sendReply(message, offerText.String())
 	if err != nil {
@@ -185,8 +183,7 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update Me
 	}
 
 	for _, match := range matches {
-		var matchesText strings.Builder
-		storedOfferToStringBuilder(match, &matchesText)
+		matchesText := storedOfferToStringBuilder(nil, match)
 
 		keyboard := createOfferKeyboard(match.UserID)
 		matchMsg := tgbotapi.NewMessage(channelID, matchesText.String())
@@ -227,7 +224,7 @@ func (ctx *BotContext) formatStoredOffers(offers []StoredOffer, listText *string
 	listText.WriteString("Recent offers:\n\n")
 
 	for _, offer := range offers {
-		storedOfferToStringBuilder(offer, listText)
+		listText = storedOfferToStringBuilder(listText, offer)
 		listText.WriteString("\n")
 	}
 }
@@ -254,22 +251,26 @@ func (ctx *BotContext) handleListCommand(message *tgbotapi.Message, update Messa
 }
 
 // storedOfferToStringBuilder formats a StoredOffer for display
-func storedOfferToStringBuilder(offer StoredOffer, listText *strings.Builder) {
-	listText.WriteString(fmt.Sprintf(
+func storedOfferToStringBuilder(sb *strings.Builder, offer StoredOffer) *strings.Builder {
+	if sb == nil {
+		sb = &strings.Builder{}
+	}
+	sb.WriteString(fmt.Sprintf(
 		"@%s [%d] ",
 		offer.Username,
 		offer.Reputation,
 	))
 
 	if offer.HaveAmount > 0 {
-		listText.WriteString(fmt.Sprintf("has %.2f %s ", offer.HaveAmount, offer.HaveCurrency))
+		sb.WriteString(fmt.Sprintf("has %.2f %s ", offer.HaveAmount, offer.HaveCurrency))
 	}
 	if offer.HaveAmount > 0 && offer.WantAmount > 0 {
-		listText.WriteString("and ")
+		sb.WriteString("and ")
 	}
 	if offer.WantAmount > 0 {
-		listText.WriteString(fmt.Sprintf("wants %.2f %s ", offer.WantAmount, offer.WantCurrency))
+		sb.WriteString(fmt.Sprintf("wants %.2f %s ", offer.WantAmount, offer.WantCurrency))
 	}
+	return sb
 }
 
 // logToTelegramAndConsole logs messages to both console and Telegram channel
