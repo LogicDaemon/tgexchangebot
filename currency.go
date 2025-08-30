@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"regexp"
@@ -281,7 +280,7 @@ func (c *tbcRateCache) run() {
 		case msg := <-c.reqCh:
 			switch m := msg.(type) {
 			case computeReq:
-				otherCur, otherAmt, err := c._computeCounterAmountInternal(m.knownCurrency, m.knownAmount, m.offerType)
+				otherCur, otherAmt, err := c._computeCounterAmountInternal(m.knownCurrency, m.knownAmount)
 				m.respCh <- computeResp{otherCurrency: otherCur, otherAmount: otherAmt, err: err}
 			case refreshReq:
 				m.respCh <- c._refresh(m.timeout)
@@ -410,9 +409,8 @@ func (c *tbcRateCache) refreshIfStaleAsync() {
 	}()
 }
 
-// _startSingleRateUpdate starts a 60s background fetch for a single currency and applies it when finished.
-// since it accesses the map, it must be called from the manager goroutine only.
-func (c *tbcRateCache) _startSingleRateUpdate(code string) {
+// startSingleRateUpdate starts a fetch for a single currency and applies it when finished.
+func (c *tbcRateCache) startSingleRateUpdate(code string) {
 	cur := strings.ToUpper(strings.TrimSpace(code))
 	// Skip base currency: its rate to base is 1 by definition
 	if cur == "" || strings.EqualFold(cur, c.base) {
@@ -453,26 +451,21 @@ func (c *tbcRateCache) _startSingleRateUpdate(code string) {
 	}()
 }
 
-// getPairRateFromList computes conversion using cached list via GEL base and buy/sell logic.
+// getPairRateFromList computes conversion using cached list via buy/sell logic.
 // Returns converted amount and true if computation was possible.
-func (c *tbcRateCache) getPairRateFromList(from, to string, amount float64) (float64, bool) {
+func (c *tbcRateCache) getPairRateFromList(from, to string, amount float64) (float64, error) {
 	if from == to {
-		return amount, true
+		return amount, nil
 	}
 
 	// foreign A -> foreign B via base
 	rateFrom := c.cachedRate(from)
 	rateTo := c.cachedRate(to)
-	if rateFrom.LastUpdated.IsZero() || time.Since(rateFrom.LastUpdated) > time.Hour {
-		go func() {
-			
-		}()
-
 	if rateFrom.Buy == 0 || rateTo.Sell == 0 {
-		return 0, false
+		return 0, fmt.Errorf("no cached rate for %s or %s", from, to)
 	}
 	gel := amount * rateFrom.Buy
-	return gel / rateTo.Sell, true
+	return gel / rateTo.Sell, nil
 }
 
 func (c *tbcRateCache) cachedRate(from string) tbcRate {
@@ -551,28 +544,28 @@ func (c *tbcRateCache) computeCounterAmount(knownCurrency string, knownAmount fl
 
 // internal compute executed in the manager goroutine
 // it calls functions which access the map, so it must be called from the manager goroutine only.
-func (c *tbcRateCache) _computeCounterAmountInternal(knownCurrency string, knownAmount float64, offerType OfferType) (otherCurrency string, otherAmount float64, err error) {
+func (c *tbcRateCache) _computeCounterAmountInternal(knownCurrency string, knownAmount float64) (otherCurrency string, otherAmount float64, err error) {
 	from := knownCurrency
 	otherCurrency = defaultCounterCurrency(knownCurrency)
 	to := otherCurrency
 
-	updates := make(string, 2)
-	for _, cur in []string{from, to} {
+	updates := make([]string, 2)
+	for _, cur := range []string{from, to} {
 		rate, ok := c.rates[cur]
 		if !ok || rate.LastUpdated.IsZero() || time.Since(rate.LastUpdated) > time.Hour {
 			updates = append(updates, cur)
 		}
 	}
 	if len(updates) == 1 {
-		c._startSingleRateUpdate(updates[0])
-	} else {
-		c.reqCh <- refreshReq{timeout: 5 * time.Second, respCh: make(chan error, 1)
+		c.startSingleRateUpdate(updates[0])
+	} else if len(updates) > 1 {
+		_ = c._refresh(10 * time.Second)
 	}
 
 	if v, e := c.tryConvertEndpoint(from, to, knownAmount); e == nil {
 		return to, v, nil
 	}
-	if v, ok := c.getPairRateFromList(from, to, knownAmount); ok {
+	if v, e := c.getPairRateFromList(from, to, knownAmount); e == nil {
 		return to, v, nil
 	}
 	return to, 0, errors.New("conversion failed and no cached rate available")
