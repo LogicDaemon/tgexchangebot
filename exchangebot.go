@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,9 +24,10 @@ const (
 )
 
 type ParsedOffer struct {
-	Type     OfferType
-	Amount   float64
-	Currency string
+	HaveAmount   float64
+	HaveCurrency string
+	WantAmount   float64
+	WantCurrency string
 }
 
 type MessageIndex struct {
@@ -33,10 +35,72 @@ type MessageIndex struct {
 	MessageID int
 }
 
+// Helper: numeric parse that supports comma decimal
+func parseNum(s string) (float64, error) {
+	s = strings.ReplaceAll(s, ",", ".")
+	return strconv.ParseFloat(s, 64)
+}
+
+var reAmountThenCurrency = regexp.MustCompile(`([0-9]+(?:[.,][0-9]+)?)([\w$₾лрд.])`)
+var reCurrencyThenAmount = regexp.MustCompile(`([\w$₾лрд.][^0-9]*)([0-9]+(?:[.,][0-9]+)?)`)
+
+func checkJoinedAmountThenCurrency(s string) (string, float64) {
+	// Check if currency and amount are in one token: 100USD or $100
+	m := reAmountThenCurrency.FindStringSubmatch(s)
+	if m == nil {
+		return "", 0
+	}
+	n, err := parseNum(m[1])
+	if err != nil || n == 0 {
+		return "", 0
+	}
+	c, ok := normalizeCurrency(m[2])
+	if !ok {
+		return "", 0
+	}
+	return c, n
+}
+
+func checkJoinedCurrencyThenAmount(s string) (string, float64) {
+	// Check if currency and amount are in one token: USD100 or $100
+	m := reCurrencyThenAmount.FindStringSubmatch(s)
+	if m == nil {
+		return "", 0
+	}
+	n, err := parseNum(m[2])
+	if err != nil || n == 0 {
+		return "", 0
+	}
+	c, ok := normalizeCurrency(m[1])
+	if !ok {
+		return "", 0
+	}
+	return c, n
+}
+
+func findOfferTokenPurpose(s string) (string, float64) {
+	// Try amount+currency joined
+	if c, n := checkJoinedAmountThenCurrency(s); n > 0 {
+		return c, n
+	}
+	if c, n := checkJoinedCurrencyThenAmount(s); n > 0 {
+		return c, n
+	}
+
+	// Try separate amount or currency
+	if n, err := parseNum(s); err == nil && n > 0 {
+		return "", n
+	}
+	if c, ok := normalizeCurrency(s); ok {
+		return c, 0
+	}
+	return "", 0
+}
+
 // parseOfferCommand parses /buy or /sell commands with amount and currency
 func parseOfferCommand(message *tgbotapi.Message) (ParsedOffer, error) {
 	parts := strings.Fields(message.CommandArguments())
-	if len(parts) < 2 {
+	if len(parts) == 0 {
 		return ParsedOffer{}, fmt.Errorf("insufficient parameters")
 	}
 
@@ -52,38 +116,54 @@ func parseOfferCommand(message *tgbotapi.Message) (ParsedOffer, error) {
 		return ParsedOffer{}, fmt.Errorf("unknown offer type: %s", command)
 	}
 
-	// Parse parts for amount and currency (order-independent, first numeric & first non-numeric)
-	var amount float64
-	var currency string
-	for _, part := range parts { // don't skip the first arg
-		if amount == 0 { // only attempt parse if we didn't already capture a number
-			if num, parseErr := strconv.ParseFloat(part, 64); parseErr == nil {
-				amount = num
-				continue
+	// [sum] currency [[sum] currency]
+	// currency [sum] [currency [sum]]
+	index := 0
+	currency := make([]string, 2)
+	amount := make([]float64, 2)
+	for _, p := range parts {
+		lp := strings.ToLower(strings.TrimSpace(p))
+		c, v := findOfferTokenPurpose(lp)
+		if c != "" {
+			if currency[index] != "" {
+				index += 1
+				if index > 1 {
+					return ParsedOffer{}, fmt.Errorf("too many currencies")
+				}
+				currency[index] = c
 			}
 		}
-		if currency == "" { // capture first non-numeric token as currency
-			currency = part
+		if v != 0 {
+			if amount[index] != 0 {
+				return ParsedOffer{}, fmt.Errorf("first currency must be specified before second")
+			}
+			amount[index] = v
 		}
 	}
-
-	if amount <= 0 {
-		return ParsedOffer{}, fmt.Errorf("invalid amount")
-	}
-	if currency == "" {
-		return ParsedOffer{}, fmt.Errorf("missing currency")
+	if currency[1] == "" && amount[1] != 0 {
+		return ParsedOffer{}, fmt.Errorf("second currency must be specified if second amount is given")
 	}
 
-	// Normalize currency (aliases and regex)
-	normCurr, ok := normalizeCurrency(currency)
-	if !ok {
-		return ParsedOffer{}, fmt.Errorf("unknown currency: %s", currency)
+	// at least one amount must be provided
+	if amount[0] == 0 && amount[1] == 0 {
+		return ParsedOffer{}, fmt.Errorf("at least one amount must be specified")
 	}
 
+	if offerType == OfferTypeBuy {
+		// Reverse for buy
+		return ParsedOffer{
+			HaveAmount:   amount[1],
+			HaveCurrency: currency[1],
+			WantAmount:   amount[0],
+			WantCurrency: currency[0],
+		}, nil
+	}
+	// Sell
 	return ParsedOffer{
-		Type:     offerType,
-		Amount:   amount,
-		Currency: normCurr,
+		HaveAmount:   amount[0],
+		HaveCurrency: currency[0],
+		WantAmount:   amount[1],
+		WantCurrency: currency[1],
 	}, nil
 }
 
@@ -136,12 +216,20 @@ func (ctx *BotContext) sendReply(original *tgbotapi.Message, replyText string) (
 func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update MessageIndex) error {
 	offer, err := parseOfferCommand(message)
 	if err != nil {
-		cmd := message.Command() // "buy" or "sell"
-		help := fmt.Sprintf(
-			"Error parsing command: %s\n\nUsage:\n/%s <amount> <CURRENCY>\n/%s <CURRENCY> <amount>\n\nExamples:\n- /%s $ 100\n- /%s 20 лар\n\n%s\n",
-			err.Error(), cmd, cmd, cmd, cmd, optionsForError(),
-		)
-		reply := tgbotapi.NewMessage(message.Chat.ID, help)
+		reply := tgbotapi.NewMessage(message.Chat.ID, fmt.Sprintf(
+			"%s\n\nUsage examples (/sell / /buy):\n"+
+				"- /sell USD 100 GEL\n"+
+				"- /sell 100 $ for GEL\n"+
+				"- /sell $ 100 - GEL 270\n"+
+				"- /sell 100 долл за 270 лар\n"+
+				"- /sell 100 USD\n\n"+
+				"You can put amount before or after currency on each side; "+
+				"connectors like 'for', 'за', '-' are ignored. "+
+				"In /sell, first currency is what you have, second is what you want. "+
+				"In /buy, it's reverse. "+
+				"If one amount is omitted, it's calculated automatically.",
+			err.Error(), optionsForError(),
+		))
 		reply.ReplyToMessageID = message.MessageID
 		_, sendErr := ctx.bot.Send(reply)
 		return sendErr
@@ -166,27 +254,18 @@ func (ctx *BotContext) handleBuySellCommand(message *tgbotapi.Message, update Me
 		Username:   message.From.UserName,
 		Reputation: reputation,
 	}
-	if offer.Type == OfferTypeSell {
-		storedOffer.HaveAmount = offer.Amount
-		storedOffer.HaveCurrency = offer.Currency
-		// compute Want*
-		if storedOffer.WantAmount == 0 || storedOffer.WantCurrency == "" {
-			otherCur, otherAmt, convErr := ctx.rates.computeCounterAmount(storedOffer.HaveCurrency, storedOffer.HaveAmount, offer.Type)
-			if convErr == nil {
-				storedOffer.WantCurrency = otherCur
-				storedOffer.WantAmount = otherAmt
-			}
-		}
-	} else {
-		storedOffer.WantAmount = offer.Amount
-		storedOffer.WantCurrency = offer.Currency
-		// compute Have*
-		if storedOffer.HaveAmount == 0 || storedOffer.HaveCurrency == "" {
-			otherCur, otherAmt, convErr := ctx.rates.computeCounterAmount(storedOffer.WantCurrency, storedOffer.WantAmount, offer.Type)
-			if convErr == nil {
-				storedOffer.HaveCurrency = otherCur
-				storedOffer.HaveAmount = otherAmt
-			}
+	// Prefer extended parsing results if present
+	storedOffer.HaveCurrency = offer.HaveCurrency
+	storedOffer.HaveAmount = offer.HaveAmount
+	storedOffer.WantCurrency = offer.WantCurrency
+	storedOffer.WantAmount = offer.WantAmount
+	// Compute missing side
+	if storedOffer.WantAmount == 0 {
+		if wantCur, wantAmt, err := ctx.rates.computeCounterAmount(storedOffer.HaveCurrency, storedOffer.WantCurrency, storedOffer.HaveAmount); err == nil {
+			storedOffer.WantCurrency = wantCur
+			storedOffer.WantAmount = wantAmt
+		} else {
+			ctx.logToTelegramAndConsole(fmt.Sprintf("Error computing amount for offer: %v", err))
 		}
 	}
 	offerText := storedOfferToStringBuilder(nil, storedOffer)
@@ -334,7 +413,7 @@ func (ctx *BotContext) handleRatesCommand(message *tgbotapi.Message, update Mess
 			age = fmt.Sprintf("%02d:%02d", h, m)
 		}
 		// USD: buy/sell and age
-		sb.WriteString(fmt.Sprintf("%s: buy=%.4f sell=%.4f age=%s\n", code, r.Buy, r.Sell, age))
+		sb.WriteString(fmt.Sprintf("%s: value=%.4f age=%s\n", code, r.value, age))
 	}
 	_, err := ctx.sendReply(message, sb.String())
 	return err

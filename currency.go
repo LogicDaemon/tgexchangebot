@@ -179,10 +179,14 @@ type tbcCommercialRatesResponse struct {
 	CommercialRatesList []tbcCommercialRate `json:"commercialRatesList"`
 }
 
-// getTBCCurrencyRatesCtx fetches commercial exchange rates from TBC Bank API with context
-// base URL: https://test-api.tbcbank.ge/v1/exchange-rates/commercial/
-func getTBCCurrencyRatesCtx(ctx context.Context, apiKey string) (*tbcCommercialRatesResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://test-api.tbcbank.ge/v1/exchange-rates/commercial/", nil)
+type tbcNbgRate struct {
+	Currency string  `json:"currency"`
+	Value    float64 `json:"value"`
+}
+
+// getTBCCurrencyRatesCtx fetches exchange rates from TBC Bank API
+func getTBCCurrencyRatesCtx(ctx context.Context, apiKey string) ([]tbcNbgRate, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://test-api.tbcbank.ge/v1/exchange-rates/nbg/", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -196,24 +200,29 @@ func getTBCCurrencyRatesCtx(ctx context.Context, apiKey string) (*tbcCommercialR
 		return nil, fmt.Errorf("TBC rates request failed with status %s: %s",
 			resp.Status, resp.Body)
 	}
-	var out tbcCommercialRatesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	var out []tbcNbgRate
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return nil, err
 	}
-	return &out, nil
+	return out, nil
 }
 
 // --- Conversion and caching ---
 
-type tbcRate struct {
+type tbcCommercialRateCached struct {
 	Buy         float64 // GEL per unit of foreign currency when bank buys foreign (you sell foreign)
 	Sell        float64 // GEL per unit when bank sells foreign (you buy foreign)
 	LastUpdated time.Time
 }
 
+type tbcRateCached struct {
+	value       float64
+	LastUpdated time.Time
+}
+
 type tbcRateCache struct {
 	apiKey      string
-	rates       map[string]tbcRate // keyed by currency code, e.g., USD, RUR
+	rates       map[string]tbcRateCached // keyed by currency code, e.g., USD, RUR
 	lastUpdated time.Time
 	reqCh       chan interface{}
 	base        string // base currency reported by API; e.g., GEL
@@ -226,7 +235,7 @@ func initCurrencyRates(apiKey string) *tbcRateCache {
 		return nil
 	}
 	c := &tbcRateCache{apiKey: apiKey,
-		rates: make(map[string]tbcRate),
+		rates: make(map[string]tbcRateCached),
 		reqCh: make(chan interface{}, 32),
 	}
 	go c.run()
@@ -234,17 +243,17 @@ func initCurrencyRates(apiKey string) *tbcRateCache {
 }
 
 // request/response messages for the manager loop
-type computeReq struct {
+type computeCounterReq struct {
 	knownCurrency string
 	knownAmount   float64
-	offerType     OfferType
+	otherCurrency string
 	respCh        chan computeResp
 }
 
 type computeResp struct {
-	otherCurrency string
-	otherAmount   float64
-	err           error
+	currency string
+	amount   float64
+	err      error
 }
 
 type refreshReq struct {
@@ -255,7 +264,7 @@ type refreshReq struct {
 // apply messages (produced by background fetchers)
 type applySingle struct {
 	code string
-	rate tbcRate
+	rate tbcRateCached
 }
 
 // snapshot request/response for safe read access
@@ -266,7 +275,7 @@ type snapshotReq struct {
 type snapshotResp struct {
 	base        string
 	cacheUpdate time.Time
-	rates       map[string]tbcRate
+	rates       map[string]tbcRateCached
 }
 
 // run is the manager goroutine processing requests and updates
@@ -279,9 +288,13 @@ func (c *tbcRateCache) run() {
 		select {
 		case msg := <-c.reqCh:
 			switch m := msg.(type) {
-			case computeReq:
-				otherCur, otherAmt, err := c._computeCounterAmountInternal(m.knownCurrency, m.knownAmount)
-				m.respCh <- computeResp{otherCurrency: otherCur, otherAmount: otherAmt, err: err}
+			case computeCounterReq:
+				destCurrency := m.otherCurrency
+				if destCurrency == "" {
+					destCurrency = defaultCounterCurrency(m.knownCurrency)
+				}
+				resultAmt, err := c._computeCounterAmountInternal(m.knownCurrency, destCurrency, m.knownAmount)
+				m.respCh <- computeResp{currency: destCurrency, amount: resultAmt, err: err}
 			case refreshReq:
 				m.respCh <- c._refresh(m.timeout)
 			case applySingle:
@@ -293,7 +306,7 @@ func (c *tbcRateCache) run() {
 				c.lastUpdated = time.Now()
 			case snapshotReq:
 				// produce a deep copy of the rates map for safe use outside
-				copyMap := make(map[string]tbcRate, len(c.rates))
+				copyMap := make(map[string]tbcRateCached, len(c.rates))
 				for k, v := range c.rates {
 					copyMap[k] = v
 				}
@@ -306,7 +319,7 @@ func (c *tbcRateCache) run() {
 }
 
 // snapshot returns a safe copy of current base, cache timestamp, and rates
-func (c *tbcRateCache) snapshot() (string, time.Time, map[string]tbcRate) {
+func (c *tbcRateCache) snapshot() (string, time.Time, map[string]tbcRateCached) {
 	respCh := make(chan snapshotResp, 1)
 	c.reqCh <- snapshotReq{respCh: respCh}
 	resp := <-respCh
@@ -330,24 +343,20 @@ func (c *tbcRateCache) _refresh(timeout time.Duration) error {
 		return err
 	}
 	// Rebuild map
-	newMap := make(map[string]tbcRate, len(out.CommercialRatesList))
-	for _, r := range out.CommercialRatesList {
+	now := time.Now()
+	newMap := make(map[string]tbcRateCached, len(out))
+	for _, r := range out {
 		code := strings.ToUpper(strings.TrimSpace(r.Currency))
 		if code == "" {
 			continue
 		}
-		newMap[code] = tbcRate{Buy: r.Buy, Sell: r.Sell}
+		newMap[code] = tbcRateCached{value: r.Value, LastUpdated: now}
 	}
-	if c.base != "" && !strings.EqualFold(c.base, out.Base) {
-		panic(fmt.Errorf("TBC base currency changed from %s to %s", c.base, out.Base))
-	}
-	c.base = strings.ToUpper(out.Base)
-	// set uniform timestamps
-	now := time.Now()
-	for k, v := range newMap {
-		v.LastUpdated = now
-		newMap[k] = v
-	}
+	// if c.base != "" && !strings.EqualFold(c.base, out.Base) {
+	// 	panic(fmt.Errorf("TBC base currency changed from %s to %s", c.base, out.Base))
+	// }
+	// c.base = strings.ToUpper(out.Base)
+	c.base = "GEL" // NBG rates are always GEL-based
 	c.rates = newMap
 	c.lastUpdated = now
 	return nil
@@ -390,18 +399,18 @@ func (c *tbcRateCache) refreshIfStaleAsync() {
 		if err != nil {
 			return
 		}
-		if !strings.EqualFold(c.base, out.Base) {
-			log.Printf("TBC base currency changed from %s to %s", c.base, out.Base)
-			c.base = strings.ToUpper(out.Base)
-		}
-		m := make(map[string]tbcRate, len(out.CommercialRatesList))
+		// if !strings.EqualFold(c.base, out.Base) {
+		// 	log.Printf("TBC base currency changed from %s to %s", c.base, out.Base)
+		// 	c.base = strings.ToUpper(out.Base)
+		// }
+		m := make(map[string]tbcRateCached, len(out))
 		now := time.Now()
-		for _, r := range out.CommercialRatesList {
+		for _, r := range out {
 			curr := strings.ToUpper(r.Currency)
 			if _, ok := currencyIndexByCode[curr]; !ok {
 				continue // skip unknown currency
 			}
-			m[curr] = tbcRate{Buy: r.Buy, Sell: r.Sell, LastUpdated: now}
+			m[curr] = tbcRateCached{value: r.Value, LastUpdated: now}
 		}
 		c.lastUpdated = now
 		c.rates = m
@@ -418,7 +427,7 @@ func (c *tbcRateCache) startSingleRateUpdate(code string) {
 	}
 	apiKey := c.apiKey
 	ch := c.reqCh
-	url := fmt.Sprintf("https://test-api.tbcbank.ge/v1/exchange-rates/commercial?currency=%s", cur)
+	url := fmt.Sprintf("https://test-api.tbcbank.ge/v1/exchange-rates/nbg?currency=%s", cur)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -437,23 +446,23 @@ func (c *tbcRateCache) startSingleRateUpdate(code string) {
 			log.Printf("Single rate request for %s status %s: %s", cur, resp.Status, resp.Body)
 			return
 		}
-		var out tbcCommercialRatesResponse
+		var out []tbcNbgRate
 		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 			log.Printf("Error decoding single rate response %s: %v", resp.Body, err)
 			return
 		}
-		for _, r := range out.CommercialRatesList {
+		for _, r := range out {
 			if strings.EqualFold(r.Currency, cur) {
-				ch <- applySingle{code: cur, rate: tbcRate{Buy: r.Buy, Sell: r.Sell, LastUpdated: time.Now()}}
+				ch <- applySingle{code: cur, rate: tbcRateCached{value: r.Value, LastUpdated: time.Now()}}
 				break
 			}
 		}
 	}()
 }
 
-// getPairRateFromList computes conversion using cached list via buy/sell logic.
+// convertAmountsByRate computes conversion using cached list via buy/sell logic.
 // Returns converted amount and true if computation was possible.
-func (c *tbcRateCache) getPairRateFromList(from, to string, amount float64) (float64, error) {
+func (c *tbcRateCache) convertAmountsByRate(from, to string, amount float64) (float64, error) {
 	if from == to {
 		return amount, nil
 	}
@@ -461,27 +470,27 @@ func (c *tbcRateCache) getPairRateFromList(from, to string, amount float64) (flo
 	// foreign A -> foreign B via base
 	rateFrom := c.cachedRate(from)
 	rateTo := c.cachedRate(to)
-	if rateFrom.Buy == 0 || rateTo.Sell == 0 {
+	if rateFrom.value == 0 || rateTo.value == 0 {
 		return 0, fmt.Errorf("no cached rate for %s or %s", from, to)
 	}
-	gel := amount * rateFrom.Buy
-	return gel / rateTo.Sell, nil
+	gel := amount * rateFrom.value
+	return gel / rateTo.value, nil
 }
 
-func (c *tbcRateCache) cachedRate(from string) tbcRate {
+func (c *tbcRateCache) cachedRate(from string) tbcRateCached {
 	if from == c.base {
-		return tbcRate{Buy: 1.0, Sell: 1.0}
+		return tbcRateCached{value: 1.0, LastUpdated: time.Now()}
 	}
 	rateFrom, ok := c.rates[from]
 	if !ok {
-		return tbcRate{}
+		return tbcRateCached{}
 	}
 	return rateFrom
 }
 
 // tryConvertEndpoint tries the convert endpoint with 2s timeout; returns value or error
 func (c *tbcRateCache) tryConvertEndpoint(from, to string, amount float64) (float64, error) {
-	url := fmt.Sprintf("https://test-api.tbcbank.ge/v1/exchange-rates/commercial/convert?From=%s&To=%s&Amount=%s",
+	url := fmt.Sprintf("https://test-api.tbcbank.ge/v1/exchange-rates/nbg/convert?From=%s&To=%s&Amount=%s",
 		from, to, trimFloat(amount))
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -535,20 +544,16 @@ func defaultCounterCurrency(code string) string {
 }
 
 // public method: compute via manager channel to avoid concurrent map access
-func (c *tbcRateCache) computeCounterAmount(knownCurrency string, knownAmount float64, offerType OfferType) (string, float64, error) {
+func (c *tbcRateCache) computeCounterAmount(from, to string, fromAmount float64) (string, float64, error) {
 	respCh := make(chan computeResp, 1)
-	c.reqCh <- computeReq{knownCurrency: knownCurrency, knownAmount: knownAmount, offerType: offerType, respCh: respCh}
+	c.reqCh <- computeCounterReq{knownCurrency: from, knownAmount: fromAmount, otherCurrency: to, respCh: respCh}
 	resp := <-respCh
-	return resp.otherCurrency, resp.otherAmount, resp.err
+	return resp.currency, resp.amount, resp.err
 }
 
 // internal compute executed in the manager goroutine
 // it calls functions which access the map, so it must be called from the manager goroutine only.
-func (c *tbcRateCache) _computeCounterAmountInternal(knownCurrency string, knownAmount float64) (otherCurrency string, otherAmount float64, err error) {
-	from := knownCurrency
-	otherCurrency = defaultCounterCurrency(knownCurrency)
-	to := otherCurrency
-
+func (c *tbcRateCache) _computeCounterAmountInternal(from, to string, knownAmount float64) (float64, error) {
 	updates := make([]string, 2)
 	for _, cur := range []string{from, to} {
 		rate, ok := c.rates[cur]
@@ -563,10 +568,10 @@ func (c *tbcRateCache) _computeCounterAmountInternal(knownCurrency string, known
 	}
 
 	if v, e := c.tryConvertEndpoint(from, to, knownAmount); e == nil {
-		return to, v, nil
+		return v, nil
 	}
-	if v, e := c.getPairRateFromList(from, to, knownAmount); e == nil {
-		return to, v, nil
+	if v, e := c.convertAmountsByRate(from, to, knownAmount); e == nil {
+		return v, nil
 	}
-	return to, 0, errors.New("conversion failed and no cached rate available")
+	return 0, errors.New("conversion failed and no cached rate available")
 }
